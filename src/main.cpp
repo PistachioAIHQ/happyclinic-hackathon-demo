@@ -76,12 +76,9 @@ void drawHeartOutline(int cx, int cy, int s) {
   int tipY = cy + s / 2;
   oled.drawCircle(cx - hr, hy, hr);
   oled.drawCircle(cx + hr, hy, hr);
-  // Two outer slopes down to the tip, forming the V.
+  // Outer slopes down to the tip, forming the V.
   oled.drawLine(cx - s / 2, hy, cx, tipY);
   oled.drawLine(cx + s / 2, hy, cx, tipY);
-  // Small cusp between the humps (the dip in the top of a heart).
-  oled.drawLine(cx - hr + hr, hy + hr - 1, cx, hy + 1);
-  oled.drawLine(cx, hy + 1, cx + hr - hr, hy + hr - 1);
 }
 
 // One large broken heart for intervention state. Draws the heart, then XORs
