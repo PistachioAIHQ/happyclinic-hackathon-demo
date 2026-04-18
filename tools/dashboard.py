@@ -605,7 +605,7 @@ HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>offpuck reception · triage coach</title>
+<title>HappyClinic · reception triage</title>
 <script defer src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
 <script src="https://unpkg.com/three@0.149.0/build/three.min.js"></script>
 <style>
@@ -965,7 +965,7 @@ HTML = r"""<!doctype html>
 </head>
 <body>
 <header>
-  <h1><span class="brand-dot"></span>offpuck<span class="thesis">staff wellbeing<span class="x">×</span>patient triage</span></h1>
+  <h1><span class="brand-dot"></span>HappyClinic<span class="thesis">staff wellbeing<span class="x">×</span>patient triage</span></h1>
   <div class="meta">
     <span><span id="dot-cam" class="dot"></span>camera</span>
     <span><span id="dot-fa"  class="dot"></span>face-api</span>
@@ -2064,7 +2064,7 @@ PATIENT_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>patient record · offpuck</title>
+<title>patient record · HappyClinic</title>
 <style>
   :root {
     --bg:#0b0d10; --panel:#14181d; --panel2:#191e25; --line:#222931;
@@ -2227,7 +2227,7 @@ PATIENT_HTML = r"""<!doctype html>
   </div>
 </main>
 
-<footer>offpuck reception · auto-refresh 1s</footer>
+<footer>HappyClinic reception · auto-refresh 1s</footer>
 
 <script>
 const PID = window.location.pathname.split("/").filter(Boolean).pop();
@@ -2422,7 +2422,7 @@ if __name__ == "__main__":
             threading.Thread(
                 target=simulate_patient, args=(pid, p["vitals_source"]), daemon=True
             ).start()
-    print(f"\n  offpuck reception ready: http://127.0.0.1:5050")
+    print(f"\n  HappyClinic reception ready: http://127.0.0.1:5050")
     print(f"  patients seeded: {', '.join(p['name'] for p in PATIENTS.values())}")
     print(f"  triage model: {MODEL}, serial: {'ok' if ser else 'offline'}\n")
     app.run(host="127.0.0.1", port=5050, debug=False)

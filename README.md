@@ -1,10 +1,10 @@
-# offpuck · reception triage demo
+# HappyClinic · hackathon demo
 
 Proactive AI for urgent-care reception. Watches patients (vitals + face) and the
 receptionist (wellbeing), and uses Claude as a triage coach that returns prioritized
 staff actions every 30 seconds.
 
-Built in a day for a hackathon demo.
+Built in a day for a Pistachio hackathon.
 
 ## What's in here
 
