@@ -586,6 +586,32 @@ def status():
     })
 
 
+@app.get("/<pid>/nps")
+def get_nps(pid: str):
+    """Numeric distress/anxiety score for a patient, intended for the ESP32
+    badge. Maps the dashboard's distress (0-1) + anxiety level (0/1/2) onto a
+    0-3 health score: 3 = calm, 0 = critical/intervention."""
+    if pid not in PATIENTS:
+        return jsonify({"error": "unknown patient", "id": pid}), 404
+    snap = patient_snapshot(pid)
+    distress = snap["distress"] or 0.0
+    anx = snap["anxiety"]
+    anx_level = anx["level"] if anx else 0
+    badness = distress + (anx_level * 0.5)  # max ~2.0
+    if badness < 0.3:   score = 3
+    elif badness < 0.8: score = 2
+    elif badness < 1.3: score = 1
+    else:               score = 0
+    return jsonify({
+        "id": pid,
+        "name": PATIENTS[pid]["name"],
+        "score": score,
+        "distress": round(distress, 3),
+        "anxiety": anx["label"] if anx else None,
+        "intervention": score == 0,
+    })
+
+
 @app.get("/")
 def index():
     return Response(HTML, mimetype="text/html")
@@ -2422,7 +2448,7 @@ if __name__ == "__main__":
             threading.Thread(
                 target=simulate_patient, args=(pid, p["vitals_source"]), daemon=True
             ).start()
-    print(f"\n  HappyClinic reception ready: http://127.0.0.1:5050")
+    print(f"\n  HappyClinic reception ready: http://0.0.0.0:5050  (LAN-reachable for ESP32 badge)")
     print(f"  patients seeded: {', '.join(p['name'] for p in PATIENTS.values())}")
     print(f"  triage model: {MODEL}, serial: {'ok' if ser else 'offline'}\n")
-    app.run(host="127.0.0.1", port=5050, debug=False)
+    app.run(host="0.0.0.0", port=5050, debug=False)

@@ -1,10 +1,27 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <U8g2lib.h>
-#include <BLEDevice.h>
-#include <BLEUtils.h>
-#include <BLEScan.h>
-#include <BLEAdvertisedDevice.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ESPmDNS.h>
+
+#include "secrets.h"
+
+#ifndef WIFI_SSID
+#define WIFI_SSID "mixpanel-guest"
+#endif
+#ifndef WIFI_PASS
+#define WIFI_PASS "analytics"
+#endif
+#ifndef SERVER_HOST
+#define SERVER_HOST "happyclinic.local"
+#endif
+#ifndef SERVER_PORT
+#define SERVER_PORT 5050
+#endif
+#ifndef PATIENT_ID
+#define PATIENT_ID "mark"
+#endif
 
 // OLED (SH1106 128x64 I2C)
 U8G2_SH1106_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
@@ -15,303 +32,274 @@ const int PIN_G = 33;
 const int PIN_B = 4;
 const bool COMMON_ANODE = false;
 
-// Standard BLE Heart Rate service + characteristic
-static BLEUUID hrServiceUUID((uint16_t)0x180D);
-static BLEUUID hrCharUUID((uint16_t)0x2A37);
+// Poll cadence — user-spec 3s
+static const unsigned long POLL_MS = 3000;
+static const unsigned long DRAW_MS = 250;
 
 // State
-static BLEAdvertisedDevice* hrDevice = nullptr;
-static BLEClient* bleClient = nullptr;
-static bool bleConnected = false;
-static bool bleScanning = false;
-static uint8_t currentHR = 0;
-static String emotion = "waiting";
+static int healthScore = 3;      // 0..3; 3 = calm, 0 = intervention
+static bool intervention = false;
+static String patientName = PATIENT_ID;
+static bool lastFetchOk = false;
+static unsigned long lastPoll = 0;
+static unsigned long lastDraw = 0;
 
-// Serial-input buffer (host -> ESP32 emotion commands)
-static String rxBuf;
-
+// ---------------- LED ---------------------------------------------------------
 void setColor(bool r, bool g, bool b) {
   digitalWrite(PIN_R, COMMON_ANODE ? !r : r);
   digitalWrite(PIN_G, COMMON_ANODE ? !g : g);
   digitalWrite(PIN_B, COMMON_ANODE ? !b : b);
 }
 
-void setHRColor(uint8_t hr) {
-  if (hr == 0)       setColor(false, false, true);
-  else if (hr < 80)  setColor(false, true,  false);
-  else if (hr < 110) setColor(true,  true,  false);
-  else               setColor(true,  false, false);
+void setScoreColor(int score) {
+  if (score <= 0)      setColor(true,  false, false);   // red -- intervene
+  else if (score == 1) setColor(true,  false, false);   // red
+  else if (score == 2) setColor(true,  true,  false);   // yellow
+  else                 setColor(false, true,  false);   // green
 }
 
-// ------- Face rendering -------
-void drawFace(int cx, int cy, int r, const String& e) {
-  oled.drawCircle(cx, cy, r);
-
-  int elx = cx - 7, erx = cx + 7, ey = cy - 3;
-
-  if (e == "surprised") {
-    oled.drawCircle(elx, ey, 3);
-    oled.drawCircle(erx, ey, 3);
-  } else if (e == "love") {
-    for (int d = 0; d <= 2; d++) {
-      oled.drawLine(elx - 3 + d, ey - 1, elx, ey + 2);
-      oled.drawLine(elx + 3 - d, ey - 1, elx, ey + 2);
-      oled.drawLine(erx - 3 + d, ey - 1, erx, ey + 2);
-      oled.drawLine(erx + 3 - d, ey - 1, erx, ey + 2);
-    }
-  } else if (e == "angry") {
-    oled.drawDisc(elx, ey + 1, 2);
-    oled.drawDisc(erx, ey + 1, 2);
-    oled.drawLine(elx - 5, ey - 5, elx + 5, ey - 2);
-    oled.drawLine(erx - 5, ey - 2, erx + 5, ey - 5);
-  } else if (e == "sad") {
-    oled.drawDisc(elx, ey + 2, 2);
-    oled.drawDisc(erx, ey + 2, 2);
-    oled.drawLine(elx - 5, ey - 3, elx + 5, ey - 1);
-    oled.drawLine(erx - 5, ey - 1, erx + 5, ey - 3);
-  } else if (e == "excited") {
-    // big open eyes
-    oled.drawCircle(elx, ey, 3);
-    oled.drawCircle(erx, ey, 3);
-    oled.drawDisc(elx, ey, 1);
-    oled.drawDisc(erx, ey, 1);
-  } else if (e == "thinking") {
-    // one squint + one normal
-    oled.drawLine(elx - 3, ey, elx + 3, ey);
-    oled.drawDisc(erx, ey, 2);
-  } else {
-    oled.drawDisc(elx, ey, 2);
-    oled.drawDisc(erx, ey, 2);
-  }
-
-  int mcx = cx, mcy = cy + 6;
-  if (e == "happy" || e == "love") {
-    oled.drawLine(mcx - 8, mcy,     mcx - 3, mcy + 5);
-    oled.drawLine(mcx - 3, mcy + 5, mcx + 3, mcy + 5);
-    oled.drawLine(mcx + 3, mcy + 5, mcx + 8, mcy);
-  } else if (e == "excited") {
-    // big grin
-    oled.drawLine(mcx - 9, mcy - 1, mcx - 4, mcy + 6);
-    oled.drawLine(mcx - 4, mcy + 6, mcx + 4, mcy + 6);
-    oled.drawLine(mcx + 4, mcy + 6, mcx + 9, mcy - 1);
-    oled.drawLine(mcx - 7, mcy + 2, mcx + 7, mcy + 2);  // teeth line
-  } else if (e == "sad") {
-    oled.drawLine(mcx - 8, mcy + 5, mcx - 3, mcy);
-    oled.drawLine(mcx - 3, mcy,     mcx + 3, mcy);
-    oled.drawLine(mcx + 3, mcy,     mcx + 8, mcy + 5);
-  } else if (e == "surprised") {
-    oled.drawCircle(mcx, mcy + 3, 4);
-  } else if (e == "angry") {
-    oled.drawLine(mcx - 8, mcy + 3, mcx + 8, mcy + 3);
-    oled.drawLine(mcx - 5, mcy + 5, mcx - 2, mcy + 1);
-    oled.drawLine(mcx + 2, mcy + 1, mcx + 5, mcy + 5);
-  } else if (e == "thinking") {
-    // off-center smirk
-    oled.drawLine(mcx - 6, mcy + 3, mcx + 6, mcy + 4);
-  } else {
-    oled.drawLine(mcx - 6, mcy + 3, mcx + 6, mcy + 3);
-  }
+// ---------------- Heart primitives -------------------------------------------
+// Hearts are two humps (discs) joined to a downward triangle, Zelda-style.
+// `s` is the nominal full width/height of the heart in pixels.
+void drawHeartFilled(int cx, int cy, int s) {
+  int hr = s / 4;                 // hump radius
+  int hy = cy - s / 6;            // hump center y
+  int tipY = cy + s / 2;
+  oled.drawDisc(cx - hr, hy, hr);
+  oled.drawDisc(cx + hr, hy, hr);
+  oled.drawTriangle(cx - s / 2, hy, cx + s / 2, hy, cx, tipY);
 }
 
-void drawOLED() {
-  oled.clearBuffer();
+void drawHeartOutline(int cx, int cy, int s) {
+  int hr = s / 4;
+  int hy = cy - s / 6;
+  int tipY = cy + s / 2;
+  oled.drawCircle(cx - hr, hy, hr);
+  oled.drawCircle(cx + hr, hy, hr);
+  // Two outer slopes down to the tip, forming the V.
+  oled.drawLine(cx - s / 2, hy, cx, tipY);
+  oled.drawLine(cx + s / 2, hy, cx, tipY);
+  // Small cusp between the humps (the dip in the top of a heart).
+  oled.drawLine(cx - hr + hr, hy + hr - 1, cx, hy + 1);
+  oled.drawLine(cx, hy + 1, cx + hr - hr, hy + hr - 1);
+}
 
-  // Face on left (cx=28, cy=26, r=18)
-  drawFace(28, 26, 18, emotion);
+// One large broken heart for intervention state. Draws the heart, then XORs
+// a zigzag crack straight down the middle by painting in color 0.
+void drawBrokenHeart(int cx, int cy, int s) {
+  int hr = s / 4;
+  int hy = cy - s / 6;
+  int tipY = cy + s / 2;
 
-  // Heart rate on right
-  oled.setFont(u8g2_font_ncenB18_tr);
-  if (currentHR > 0) {
-    char hr[8];
-    snprintf(hr, sizeof(hr), "%d", currentHR);
-    int w = oled.getStrWidth(hr);
-    oled.drawStr(95 - w / 2, 28, hr);
-    oled.setFont(u8g2_font_6x10_tr);
-    oled.drawStr(95 - oled.getStrWidth("bpm") / 2, 40, "bpm");
-  } else {
-    oled.setFont(u8g2_font_6x10_tr);
-    const char* msg1 = bleConnected ? "HR" : (bleScanning ? "scan..." : "no HR");
-    const char* msg2 = bleConnected ? "---" : "";
-    oled.drawStr(95 - oled.getStrWidth(msg1) / 2, 24, msg1);
-    if (*msg2) oled.drawStr(95 - oled.getStrWidth(msg2) / 2, 36, msg2);
+  // Filled heart body.
+  oled.drawDisc(cx - hr, hy, hr);
+  oled.drawDisc(cx + hr, hy, hr);
+  oled.drawTriangle(cx - s / 2, hy, cx + s / 2, hy, cx, tipY);
+
+  // Zigzag crack, erased through the body so the split is visible.
+  oled.setDrawColor(0);
+  int zig[] = {-2, 2, -2, 2, -1, 1, 0};   // x offsets top -> tip
+  int segs = sizeof(zig) / sizeof(zig[0]);
+  int y0 = hy - hr;
+  int ySpan = tipY - y0;
+  int prevX = cx + zig[0];
+  int prevY = y0;
+  for (int i = 1; i < segs; i++) {
+    int y = y0 + (ySpan * i) / (segs - 1);
+    int x = cx + zig[i];
+    // 3-pixel-wide erased band to make the crack readable on a 128x64 OLED.
+    oled.drawLine(prevX - 1, prevY, x - 1, y);
+    oled.drawLine(prevX,     prevY, x,     y);
+    oled.drawLine(prevX + 1, prevY, x + 1, y);
+    prevX = x; prevY = y;
   }
+  oled.setDrawColor(1);
+}
 
-  // Emotion label across bottom
+// ---------------- Screen ------------------------------------------------------
+void drawStatusLine() {
   oled.setFont(u8g2_font_6x10_tr);
-  int ew = oled.getStrWidth(emotion.c_str());
-  oled.drawStr(64 - ew / 2, 62, emotion.c_str());
+  // Left: patient name (truncated if needed).
+  char left[20];
+  snprintf(left, sizeof(left), "%s", patientName.c_str());
+  oled.drawStr(2, 9, left);
 
-  // Divider
-  oled.drawHLine(0, 50, 128);
+  // Right: connection state.
+  const char* st;
+  if (!WiFi.isConnected())  st = "no wifi";
+  else if (!lastFetchOk)    st = "...";
+  else                      st = "ok";
+  int w = oled.getStrWidth(st);
+  oled.drawStr(128 - w - 2, 9, st);
+
+  oled.drawHLine(0, 12, 128);
+}
+
+void drawHeartBar() {
+  oled.clearBuffer();
+  drawStatusLine();
+
+  if (healthScore <= 0) {
+    // Intervention: one large broken heart + label.
+    drawBrokenHeart(64, 34, 38);
+    oled.setFont(u8g2_font_6x10_tr);
+    const char* msg = "INTERVENE";
+    int w = oled.getStrWidth(msg);
+    oled.drawStr(64 - w / 2, 62, msg);
+  } else {
+    // 3 small hearts, filled from left by score.
+    const int s = 18;
+    const int xs[3] = {28, 64, 100};
+    const int cy = 36;
+    for (int i = 0; i < 3; i++) {
+      if (i < healthScore) drawHeartFilled(xs[i], cy, s);
+      else                 drawHeartOutline(xs[i], cy, s);
+    }
+    // Score label at the bottom.
+    oled.setFont(u8g2_font_6x10_tr);
+    char lbl[10];
+    snprintf(lbl, sizeof(lbl), "%d / 3", healthScore);
+    int w = oled.getStrWidth(lbl);
+    oled.drawStr(64 - w / 2, 62, lbl);
+  }
 
   oled.sendBuffer();
 }
 
-// ------- BLE HR -------
-static void onHRNotify(BLERemoteCharacteristic* c, uint8_t* data, size_t len, bool isNotify) {
-  if (len < 2) return;
-  uint8_t flags = data[0];
-  size_t idx = 1;
-  uint16_t hr;
-  if (flags & 0x01) {
-    if (len < 3) return;
-    hr = data[idx] | (data[idx + 1] << 8);
-    idx += 2;
+// ---------------- WiFi + polling ---------------------------------------------
+void connectWiFi() {
+  if (WiFi.isConnected()) return;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("wifi: connecting to %s ...\n", WIFI_SSID);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(250);
+  }
+  if (WiFi.isConnected()) {
+    Serial.printf("wifi: ok ip=%s\n", WiFi.localIP().toString().c_str());
+    if (!MDNS.begin("happyclinic-badge")) Serial.println("mdns: init failed");
   } else {
-    hr = data[idx];
-    idx += 1;
-  }
-  currentHR = hr;
-  Serial.printf("hr:%u\n", (unsigned)hr);
-
-  // Skip energy expended if flagged
-  if (flags & 0x08) idx += 2;
-
-  // RR intervals — each uint16 LE in 1/1024 s units; may be multiple per frame
-  if ((flags & 0x10) && idx + 1 < len) {
-    char line[160]; size_t p = 0;
-    p += snprintf(line + p, sizeof(line) - p, "rr:");
-    bool first = true;
-    while (idx + 1 < len && p < sizeof(line) - 10) {
-      uint16_t rr1024 = data[idx] | (data[idx + 1] << 8);
-      idx += 2;
-      unsigned rr_ms = (unsigned)((rr1024 * 1000UL + 512) / 1024);  // round to nearest ms
-      p += snprintf(line + p, sizeof(line) - p, "%s%u", first ? "" : ",", rr_ms);
-      first = false;
-    }
-    if (!first) {
-      line[p < sizeof(line) - 1 ? p : sizeof(line) - 1] = 0;
-      Serial.println(line);
-    }
+    Serial.println("wifi: TIMEOUT");
   }
 }
 
-class HRScanCallback : public BLEAdvertisedDeviceCallbacks {
-  void onResult(BLEAdvertisedDevice dev) override {
-    if (dev.haveServiceUUID() && dev.isAdvertisingService(hrServiceUUID)) {
-      Serial.printf("found HR: %s\n", dev.toString().c_str());
-      hrDevice = new BLEAdvertisedDevice(dev);
-      BLEDevice::getScan()->stop();
-      bleScanning = false;
-    }
-  }
-};
-
-void cleanupBLE() {
-  if (bleClient) {
-    if (bleClient->isConnected()) bleClient->disconnect();
-    delete bleClient;
-    bleClient = nullptr;
-  }
-  if (hrDevice) {
-    delete hrDevice;
-    hrDevice = nullptr;
-  }
-  bleConnected = false;
-  currentHR = 0;
-}
-
-void startScan() {
-  bleScanning = true;
-  BLEScan* scan = BLEDevice::getScan();
-  scan->clearResults();
-  scan->start(30, false);
-}
-
-bool connectToHR() {
-  Serial.println("connecting HR...");
-  delay(250);  // let scan fully wind down before GATT connect
-  if (bleClient) { delete bleClient; bleClient = nullptr; }
-  bleClient = BLEDevice::createClient();
-
-  if (!bleClient->connect(hrDevice)) {
-    Serial.println("connect failed; rescanning");
-    cleanupBLE();
-    startScan();
-    return false;
-  }
-
-  BLERemoteService* svc = bleClient->getService(hrServiceUUID);
-  if (!svc) { Serial.println("no HR service; rescanning"); cleanupBLE(); startScan(); return false; }
-
-  BLERemoteCharacteristic* chr = svc->getCharacteristic(hrCharUUID);
-  if (!chr) { Serial.println("no HR char; rescanning"); cleanupBLE(); startScan(); return false; }
-
-  if (chr->canNotify()) chr->registerForNotify(onHRNotify);
-  bleConnected = true;
-  Serial.println("HR subscribed");
+// Tiny JSON scraper — avoids pulling in ArduinoJson for three fields.
+static bool extractInt(const String& src, const char* key, int* out) {
+  int i = src.indexOf(key);
+  if (i < 0) return false;
+  int c = src.indexOf(':', i);
+  if (c < 0) return false;
+  int j = c + 1;
+  while (j < (int)src.length() && (src[j] == ' ' || src[j] == '\t')) j++;
+  if (j >= (int)src.length()) return false;
+  bool neg = false;
+  if (src[j] == '-') { neg = true; j++; }
+  if (j >= (int)src.length() || !isdigit(src[j])) return false;
+  int v = 0;
+  while (j < (int)src.length() && isdigit(src[j])) { v = v * 10 + (src[j] - '0'); j++; }
+  *out = neg ? -v : v;
   return true;
 }
 
-// ------- Serial host commands -------
-void handleLine(String line) {
-  line.trim();
-  if (line.startsWith("emotion:")) {
-    String e = line.substring(8);
-    e.toLowerCase();
-    e.trim();
-    if (e.length()) {
-      emotion = e;
-      drawOLED();
-    }
-  }
+static bool extractBool(const String& src, const char* key, bool* out) {
+  int i = src.indexOf(key);
+  if (i < 0) return false;
+  int c = src.indexOf(':', i);
+  if (c < 0) return false;
+  int t = src.indexOf("true",  c);
+  int f = src.indexOf("false", c);
+  // Pick whichever comes first after the colon within ~12 chars.
+  if (t > 0 && (f < 0 || t < f) && t - c < 12) { *out = true;  return true; }
+  if (f > 0 && f - c < 12)                     { *out = false; return true; }
+  return false;
 }
 
-void pollSerial() {
-  while (Serial.available()) {
-    char c = Serial.read();
-    if (c == '\n' || c == '\r') {
-      if (rxBuf.length()) handleLine(rxBuf);
-      rxBuf = "";
-    } else {
-      rxBuf += c;
-      if (rxBuf.length() > 80) rxBuf = "";
-    }
-  }
+static bool extractString(const String& src, const char* key, String* out) {
+  int i = src.indexOf(key);
+  if (i < 0) return false;
+  int c = src.indexOf(':', i);
+  if (c < 0) return false;
+  int q1 = src.indexOf('"', c);
+  if (q1 < 0) return false;
+  int q2 = src.indexOf('"', q1 + 1);
+  if (q2 <= q1) return false;
+  *out = src.substring(q1 + 1, q2);
+  return true;
 }
 
-// ------- Setup / loop -------
+bool pollNPS() {
+  if (!WiFi.isConnected()) return false;
+  HTTPClient http;
+  char url[160];
+  snprintf(url, sizeof(url), "http://%s:%d/%s/nps", SERVER_HOST, SERVER_PORT, PATIENT_ID);
+  if (!http.begin(url)) { Serial.println("http begin failed"); return false; }
+  http.setTimeout(2500);
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("nps http=%d url=%s\n", code, url);
+    http.end();
+    return false;
+  }
+  String body = http.getString();
+  http.end();
+
+  int score = healthScore;
+  bool iv = intervention;
+  String name = patientName;
+  if (!extractInt(body, "\"score\"", &score)) {
+    Serial.println("nps: no score");
+    return false;
+  }
+  extractBool(body, "\"intervention\"", &iv);
+  extractString(body, "\"name\"", &name);
+
+  if (score < 0) score = 0;
+  if (score > 3) score = 3;
+  healthScore = score;
+  intervention = iv;
+  patientName = name;
+  Serial.printf("nps ok: %s score=%d intervene=%d\n", name.c_str(), score, iv ? 1 : 0);
+  return true;
+}
+
+// ---------------- Setup / loop -----------------------------------------------
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n--- offpuck: emotion + HR ---");
+  Serial.println("\n--- happyclinic badge: hearts ---");
 
   pinMode(PIN_R, OUTPUT);
   pinMode(PIN_G, OUTPUT);
   pinMode(PIN_B, OUTPUT);
-  setColor(false, false, false);
+  setColor(false, false, true);   // blue = booting
 
   oled.begin();
-  drawOLED();
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_6x10_tr);
+  oled.drawStr(2, 14, "happyclinic badge");
+  oled.drawStr(2, 30, "wifi: ");
+  oled.drawStr(40, 30, WIFI_SSID);
+  oled.drawStr(2, 46, "patient: ");
+  oled.drawStr(54, 46, PATIENT_ID);
+  oled.sendBuffer();
 
-  BLEDevice::init("OffPuck");
-  BLEScan* scan = BLEDevice::getScan();
-  scan->setAdvertisedDeviceCallbacks(new HRScanCallback());
-  scan->setActiveScan(true);
-  scan->setInterval(100);
-  scan->setWindow(99);
-  startScan();
+  connectWiFi();
 }
 
-unsigned long lastDraw = 0;
-
 void loop() {
-  pollSerial();
+  unsigned long now = millis();
 
-  if (hrDevice && !bleConnected) {
-    connectToHR();  // handles its own cleanup + rescan on failure
+  if (now - lastPoll >= POLL_MS) {
+    lastPoll = now;
+    if (!WiFi.isConnected()) connectWiFi();
+    lastFetchOk = pollNPS();
   }
 
-  if (bleClient && bleConnected && !bleClient->isConnected()) {
-    Serial.println("HR disconnected, rescanning");
-    cleanupBLE();
-    startScan();
-  }
-
-  if (millis() - lastDraw > 500) {
-    drawOLED();
-    setHRColor(currentHR);
-    lastDraw = millis();
+  if (now - lastDraw >= DRAW_MS) {
+    lastDraw = now;
+    drawHeartBar();
+    setScoreColor(healthScore);
   }
 
   delay(10);
