@@ -1,0 +1,14 @@
+.pio
+.vscode/
+
+# Secrets — local-only
+src/secrets.h
+
+# Python / Mac
+__pycache__/
+*.pyc
+.DS_Store
+
+# Intermediate / backup
+tools/*.bak.py
+tools/*.bak
