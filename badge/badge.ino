@@ -1,5 +1,5 @@
 // HappyClinic badge — Arduino Nano ESP32.
-// Polls the dashboard every 3 s at /<PATIENT_ID>/nps and renders a Zelda-
+// Polls the dashboard every 3 s at /badge/<BADGE_ID>/nps and renders a Zelda-
 // style health bar on the 1.3" SH1106 OLED (3 hearts -> calm, 1 -> high
 // distress, broken heart + INTERVENE -> clinical escalation).
 //
@@ -26,8 +26,9 @@
 #define SERVER_HOST "status-sufferer-backlog.ngrok-free.dev"
 #define SERVER_PORT 80
 
-// Which patient this badge displays. Must match a key in tools/dashboard.py.
-#define PATIENT_ID  "mark"
+// Stable device identity. The dashboard maps this badge to a patient live, so
+// you can reassign it from the web app without reflashing.
+#define BADGE_ID    "badge-1"
 
 // ---------------- Hardware ---------------------------------------------------
 // 1.3" SH1106 128x64 on I2C. Wire.setPins(D3, D2) matches the reference sketch
@@ -40,7 +41,7 @@ static const unsigned long DRAW_MS = 250;
 
 static int     healthScore   = 3;      // 0..3; 3 = calm, 0 = intervention
 static bool    intervention  = false;
-static String  patientName   = PATIENT_ID;
+static String  patientName   = BADGE_ID;
 static bool    lastFetchOk   = false;
 static unsigned long lastPoll = 0;
 static unsigned long lastDraw = 0;
@@ -204,7 +205,7 @@ static bool pollNPS() {
   if (!WiFi.isConnected()) return false;
   HTTPClient http;
   char path[64];
-  snprintf(path, sizeof(path), "/%s/nps", PATIENT_ID);
+  snprintf(path, sizeof(path), "/badge/%s/nps", BADGE_ID);
 
   IPAddress resolved;
   if (WiFi.hostByName(SERVER_HOST, resolved)) {
@@ -266,7 +267,7 @@ void setup() {
   oled.drawStr(2, 30, "wifi: ");
   oled.drawStr(40, 30, WIFI_SSID);
   oled.drawStr(2, 46, "patient: ");
-  oled.drawStr(54, 46, PATIENT_ID);
+  oled.drawStr(54, 46, BADGE_ID);
   oled.sendBuffer();
 
   connectWiFi();

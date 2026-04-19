@@ -22,6 +22,9 @@ BAUD = int(os.getenv("HAPPYCLINIC_SERIAL_BAUD", "115200"))
 MODEL = os.getenv("HAPPYCLINIC_MODEL", "claude-sonnet-4-6")
 LISTEN_HOST = os.getenv("HAPPYCLINIC_LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.getenv("HAPPYCLINIC_LISTEN_PORT", "5050"))
+BADGE_ID = os.getenv("HAPPYCLINIC_BADGE_ID", "badge-1")
+BADGE_LABEL = os.getenv("HAPPYCLINIC_BADGE_LABEL", "waiting room badge")
+BADGE_DEFAULT_PATIENT = os.getenv("HAPPYCLINIC_BADGE_PATIENT", "mark")
 FACE_MATCH_THRESHOLD = 0.55    # euclidean distance — 0.4 strict, 0.6 forgiving
 SESSION_START = time.time()
 
@@ -98,6 +101,10 @@ receptionist: dict = {
     "emotion": None,
     "emotion_history": deque(maxlen=400),
     "last_seen_ts": None,
+}
+
+badge_assignments: dict[str, Optional[str]] = {
+    BADGE_ID: BADGE_DEFAULT_PATIENT if BADGE_DEFAULT_PATIENT in PATIENTS else None,
 }
 
 # -------- Flask + Anthropic ---------------------------------------------------
@@ -353,6 +360,42 @@ def patient_snapshot(pid: str) -> dict:
     }
 
 
+def nps_payload(pid: str) -> dict:
+    """Numeric distress/anxiety score for a patient, intended for the badge."""
+    snap = patient_snapshot(pid)
+    distress = snap["distress"] or 0.0
+    anx = snap["anxiety"]
+    anx_level = anx["level"] if anx else 0
+    badness = distress + (anx_level * 0.5)  # max ~2.0
+    if badness < 0.3:
+        score = 3
+    elif badness < 0.8:
+        score = 2
+    elif badness < 1.3:
+        score = 1
+    else:
+        score = 0
+    return {
+        "id": pid,
+        "name": PATIENTS[pid]["name"],
+        "score": score,
+        "distress": round(distress, 3),
+        "anxiety": anx["label"] if anx else None,
+        "intervention": score == 0,
+    }
+
+
+def badge_snapshot(badge_id: str) -> dict:
+    with state_lock:
+        patient_id = badge_assignments.get(badge_id)
+    return {
+        "id": badge_id,
+        "label": BADGE_LABEL if badge_id == BADGE_ID else badge_id,
+        "patient_id": patient_id,
+        "patient_name": PATIENTS[patient_id]["name"] if patient_id in PATIENTS else None,
+    }
+
+
 # -------- Face recognition ----------------------------------------------------
 
 def euclid(a: list[float], b: list[float]) -> float:
@@ -581,6 +624,7 @@ def status():
         "serial_open": ser is not None,
         "model": MODEL,
         "current_visitor": current_visitor,
+        "badges": [badge_snapshot(bid) for bid in badge_assignments],
         "patients": snaps,
         "stats": stats,
         "triage": list(triage_history)[-5:],
@@ -591,28 +635,43 @@ def status():
 
 @app.get("/<pid>/nps")
 def get_nps(pid: str):
-    """Numeric distress/anxiety score for a patient, intended for the ESP32
-    badge. Maps the dashboard's distress (0-1) + anxiety level (0/1/2) onto a
-    0-3 health score: 3 = calm, 0 = critical/intervention."""
     if pid not in PATIENTS:
         return jsonify({"error": "unknown patient", "id": pid}), 404
-    snap = patient_snapshot(pid)
-    distress = snap["distress"] or 0.0
-    anx = snap["anxiety"]
-    anx_level = anx["level"] if anx else 0
-    badness = distress + (anx_level * 0.5)  # max ~2.0
-    if badness < 0.3:   score = 3
-    elif badness < 0.8: score = 2
-    elif badness < 1.3: score = 1
-    else:               score = 0
-    return jsonify({
-        "id": pid,
-        "name": PATIENTS[pid]["name"],
-        "score": score,
-        "distress": round(distress, 3),
-        "anxiety": anx["label"] if anx else None,
-        "intervention": score == 0,
-    })
+    return jsonify(nps_payload(pid))
+
+
+@app.get("/badge/<badge_id>/nps")
+def get_badge_nps(badge_id: str):
+    if badge_id not in badge_assignments:
+        return jsonify({"error": "unknown badge", "id": badge_id}), 404
+    snap = badge_snapshot(badge_id)
+    if not snap["patient_id"]:
+        return jsonify({
+            "badge_id": badge_id,
+            "assigned_patient_id": None,
+            "name": "badge idle",
+            "score": 3,
+            "distress": 0.0,
+            "anxiety": None,
+            "intervention": False,
+        })
+    payload = nps_payload(snap["patient_id"])
+    payload["badge_id"] = badge_id
+    payload["assigned_patient_id"] = snap["patient_id"]
+    return jsonify(payload)
+
+
+@app.post("/badge/<badge_id>/assign")
+def post_badge_assign(badge_id: str):
+    if badge_id not in badge_assignments:
+        return jsonify({"ok": False, "error": "unknown badge"}), 404
+    data = request.get_json(force=True) if request.data else {}
+    patient_id = data.get("patient_id")
+    if patient_id is not None and patient_id not in PATIENTS:
+        return jsonify({"ok": False, "error": "unknown patient"}), 400
+    with state_lock:
+        badge_assignments[badge_id] = patient_id
+    return jsonify({"ok": True, "badge": badge_snapshot(badge_id)})
 
 
 @app.get("/")
@@ -724,6 +783,7 @@ HTML = r"""<!doctype html>
   .pill.balanced { background: var(--warn); color: #0b0d10; }
   .pill.elevated { background: var(--err); color: #fff; }
   .pill.unknown { border: 1px solid var(--line); color: var(--mute); }
+  .pill.badge { background: rgba(210,168,255,0.14); color: var(--claude); border: 1px solid rgba(210,168,255,0.35); }
 
   /* Right: triage hero + queue */
   .right-col { display: grid; grid-template-rows: auto 1fr auto; min-height: 0; gap: 12px; }
@@ -949,6 +1009,9 @@ HTML = r"""<!doctype html>
     padding: 12px 16px 14px; border-top: 1px solid var(--line);
     display: grid; gap: 8px; font-size: 12px;
   }
+  .pi-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .badge-assign-btn.assigned { border-color: var(--claude); color: var(--claude); }
+  .badge-clear-btn:hover { border-color: var(--err); color: var(--err); }
   .pi-body .complaint { font-style: italic; color: var(--text); }
   .pi-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 14px; color: var(--mute); font-size: 11px; }
   .pi-grid b { color: var(--text); font-weight: 500; }
@@ -1205,6 +1268,8 @@ let lastFaceDetectedAt = 0;        // for claim-panel throttling
 let nextTriageAt = 0;
 let lastTriageIds = new Set();
 let frameCount = 0, lastFpsCount = 0, lastFpsAt = performance.now();
+let badges = [];
+let primaryBadgeId = "badge-1";
 
 // --- Camera + face-api ---
 let povStream = null, recepStream = null;
@@ -1394,6 +1459,30 @@ async function claimCurrentFace(pid) {
   } catch {}
 }
 
+async function assignBadge(patientId) {
+  if (!primaryBadgeId) return;
+  try {
+    const r = await fetch(`/badge/${encodeURIComponent(primaryBadgeId)}/assign`, {
+      method: "POST", headers: {"content-type":"application/json"},
+      body: JSON.stringify({ patient_id: patientId }),
+    });
+    const j = await r.json();
+    if (j.ok) pollStatus();
+  } catch {}
+}
+
+async function clearBadge() {
+  if (!primaryBadgeId) return;
+  try {
+    const r = await fetch(`/badge/${encodeURIComponent(primaryBadgeId)}/assign`, {
+      method: "POST", headers: {"content-type":"application/json"},
+      body: JSON.stringify({ patient_id: null }),
+    });
+    const j = await r.json();
+    if (j.ok) pollStatus();
+  } catch {}
+}
+
 async function resetEnrollments() {
   if (!confirm("Clear all face enrollments? Patient records remain; descriptors are wiped.")) return;
   try { await fetch("/reset", { method: "POST" }); pollStatus(); } catch {}
@@ -1540,9 +1629,10 @@ function renderStats(stats, patients) {
 
 const patientOpenState = new Set();   // user-expanded patients persist across renders
 
-function renderPatientList(patients, current) {
+function renderPatientList(patients, current, badgeList) {
   patientsById = {};
   for (const p of patients) patientsById[p.id] = p;
+  badges = badgeList || [];
   // Sort: at-counter first, then elevated, then by wait desc
   const priorityOf = p => (p.id === current ? 0 : p.anxiety?.label === "elevated" ? 1 : 2);
   const sorted = [...patients].sort((a, b) => priorityOf(a) - priorityOf(b) || (b.wait_s || 0) - (a.wait_s || 0));
@@ -1570,6 +1660,8 @@ function renderPatientList(patients, current) {
       : p.hrv ? `HR stdev ~${p.hrv.hr_stdev_bpm} bpm (proxy)` : "awaiting samples";
     const anxPill = anx !== "unknown" ? `<span class="pill ${anx}">${anx}</span>` : `<span class="pill unknown">—</span>`;
     const emo = EMOJIS[p.emotion] || "—";
+    const assignedBadge = badges.find(b => b.patient_id === p.id);
+    const badgePill = assignedBadge ? `<span class="pill badge">${escapeHtml(assignedBadge.label)}</span>` : "";
 
     det.innerHTML = `
       <summary>
@@ -1582,6 +1674,7 @@ function renderPatientList(patients, current) {
           <span class="bay">${escapeHtml(p.bay)}</span>
           <span class="hr">${hrTxt}♥</span>
           ${anxPill}
+          ${badgePill}
           <span>${emo}</span>
         </span>
         <span class="pi-wait ${waitCls}">${waitTxt}</span>
@@ -1589,6 +1682,12 @@ function renderPatientList(patients, current) {
       </summary>
       <div class="pi-body">
         <div class="complaint">"${escapeHtml(p.chief_complaint)}"</div>
+        <div class="pi-actions">
+          <button class="badge-assign-btn ${assignedBadge ? "assigned" : ""}" type="button">
+            ${assignedBadge ? `${escapeHtml(assignedBadge.label)} assigned` : "assign badge"}
+          </button>
+          ${assignedBadge ? '<button class="badge-clear-btn" type="button">clear badge</button>' : ""}
+        </div>
         <div class="pi-vitals-row">
           <span class="chip">HR <b>${hrTxt} bpm</b></span>
           <span class="chip">HRV <b>${escapeHtml(hrvTxt)}</b></span>
@@ -1603,6 +1702,16 @@ function renderPatientList(patients, current) {
           <div style="grid-column:1/3;">last visit <b>${escapeHtml(p.last_visit)}</b></div>
         </div>
       </div>`;
+    det.querySelector(".badge-assign-btn")?.addEventListener("click", ev => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      assignBadge(p.id);
+    });
+    det.querySelector(".badge-clear-btn")?.addEventListener("click", ev => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      clearBadge();
+    });
     patientListEl.appendChild(det);
   }
 
@@ -1664,12 +1773,14 @@ function renderFloorPlan(patients, current) {
 async function pollStatus() {
   try {
     const r = await fetch("/status"); const j = await r.json();
+    badges = j.badges || [];
+    primaryBadgeId = badges[0]?.id || primaryBadgeId;
     modelName.textContent = j.model;
     dotEsp.classList.toggle("on", j.serial_open);
     dotEsp.classList.toggle("off", !j.serial_open);
     clockEl.textContent = new Date(j.now_ms).toLocaleTimeString();
     renderStats(j.stats, j.patients);
-    renderPatientList(j.patients, j.current_visitor);
+    renderPatientList(j.patients, j.current_visitor, badges);
     update3DPatients(j.patients, j.current_visitor);
     updateClaimPanel(j.patients, j.current_visitor);
     renderReceptionist(j.receptionist);
