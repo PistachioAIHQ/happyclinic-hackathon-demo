@@ -14,18 +14,17 @@
 #include <U8g2lib.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <WiFiClientSecure.h>
 #include <ESPmDNS.h>
 
 // ---------------- Config (edit in place) -------------------------------------
 #define WIFI_SSID   "mixpanel-guest"
 #define WIFI_PASS   "analytics"
 
-// Public ngrok endpoint for the dashboard. We use HTTPS plus ngrok's
-// device-safe skip-warning header so the badge can poll JSON without opening a
-// firewall port on the laptop.
+// Public ngrok endpoint for the dashboard. We use the explicit public HTTP
+// endpoint plus ngrok's skip-warning header so the badge can poll JSON without
+// opening a firewall port on the laptop or dealing with ESP32 TLS quirks.
 #define SERVER_HOST "status-sufferer-backlog.ngrok-free.dev"
-#define SERVER_PORT 443
+#define SERVER_PORT 80
 
 // Which patient this badge displays. Must match a key in tools/dashboard.py.
 #define PATIENT_ID  "mark"
@@ -203,9 +202,6 @@ static bool extractString(const String& src, const char* key, String* out) {
 
 static bool pollNPS() {
   if (!WiFi.isConnected()) return false;
-  WiFiClientSecure client;
-  client.setInsecure();  // Demo-only: accept ngrok's cert without CA pinning.
-  client.setTimeout(5000);
   HTTPClient http;
   char path[64];
   snprintf(path, sizeof(path), "/%s/nps", PATIENT_ID);
@@ -217,7 +213,7 @@ static bool pollNPS() {
     Serial.printf("dns: failed for %s\n", SERVER_HOST);
   }
 
-  if (!http.begin(client, SERVER_HOST, SERVER_PORT, path, true)) {
+  if (!http.begin(String("http://") + SERVER_HOST + path)) {
     Serial.println("http begin failed");
     return false;
   }
