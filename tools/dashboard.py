@@ -98,6 +98,10 @@ def _blank_vitals() -> dict:
         "emotion_history": deque(maxlen=200),      # {ts, emotion}
         "last_seen_ts": None,
         "rr_samples": deque(maxlen=600),           # (ts, rr_ms)
+        # Body language (MediaPipe PoseLandmarker on the POV cam).
+        "arms_state": "unknown",                   # "open" | "crossed" | "unknown"
+        "arms_ts": 0.0,                            # wall time of last "crossed" observation
+        "arms_history": deque(maxlen=120),         # {ts, state} debounced transitions
     }
 
 vitals: dict[str, dict] = {pid: _blank_vitals() for pid in PATIENTS}
@@ -292,16 +296,37 @@ def anxiety_from_hrv(hrv: Optional[dict]) -> Optional[dict]:
     return {"level": level, "label": label, "metric": f"HR stdev {s} bpm", "proxy": True}
 
 
+# Crossed arms within this window boosts distress. Window is intentionally a
+# little longer than the debounce so transient transitions still count.
+ARMS_ACTIVE_WINDOW_S = 20.0
+ARMS_DISTRESS_BOOST = 0.15
+
+
+def arms_active(pid: str) -> bool:
+    """True if the patient's last debounced arms state is 'crossed' and fresh."""
+    with state_lock:
+        v = vitals[pid]
+        state = v.get("arms_state")
+        ts = v.get("arms_ts", 0.0)
+    return state == "crossed" and ts and (time.time() - ts) < ARMS_ACTIVE_WINDOW_S
+
+
 def distress_index(pid: str, window_s: float = 30.0) -> float:
-    """0 (calm/positive) -> 1 (distressed). From rolling emotion labels."""
+    """0 (calm/positive) -> 1 (distressed). From rolling emotion labels,
+    with a small additive bump if the patient is currently reading as
+    arms-crossed (body-language signal from MediaPipe PoseLandmarker)."""
     now_ms = int(time.time() * 1000)
     with state_lock:
         recent = [e for e in vitals[pid]["emotion_history"] if now_ms - e["ts"] <= window_s * 1000]
-    if not recent:
-        return 0.0
-    weights = {"happy": -1.0, "neutral": 0.0, "sad": 1.0, "angry": 1.0, "surprised": 0.5}
-    s = sum(weights.get(e["emotion"], 0.0) for e in recent) / len(recent)
-    return round(max(0.0, min(1.0, (s + 1.0) / 2.0)), 2)
+    if recent:
+        weights = {"happy": -1.0, "neutral": 0.0, "sad": 1.0, "angry": 1.0, "surprised": 0.5}
+        s = sum(weights.get(e["emotion"], 0.0) for e in recent) / len(recent)
+        base = max(0.0, min(1.0, (s + 1.0) / 2.0))
+    else:
+        base = 0.0
+    if arms_active(pid):
+        base = min(1.0, base + ARMS_DISTRESS_BOOST)
+    return round(base, 2)
 
 
 def wait_seconds(pid: str) -> Optional[float]:
@@ -349,6 +374,10 @@ def patient_snapshot(pid: str) -> dict:
         last_seen = v["last_seen_ts"]
         history_pts = len(v["hr_history"])
         hr_series = list(v["hr_history"])[-180:]
+        arms_state = v.get("arms_state", "unknown")
+        arms_ts = v.get("arms_ts", 0.0)
+    arms_fresh = arms_state == "crossed" and arms_ts and (time.time() - arms_ts) < ARMS_ACTIVE_WINDOW_S
+    arms_report = "crossed" if arms_fresh else (arms_state if arms_state in ("open", "unknown") else "open")
     hr_fresh = hr if hr_ts and time.time() - hr_ts < 10 else None
     return {
         "id": p["id"],
@@ -369,6 +398,8 @@ def patient_snapshot(pid: str) -> dict:
         "anxiety": anx,
         "distress": distress_index(pid),
         "emotion": emotion,
+        "arms": arms_report,
+        "arms_active": bool(arms_fresh),
         "hr_series": [[int(t * 1000), h] for (t, h) in hr_series],
         "history_pts": history_pts,
         "last_seen_s": round(time.time() - last_seen, 1) if last_seen else None,
@@ -673,6 +704,34 @@ def post_emotion():
     return jsonify({"ok": True, "sent_serial": sent, "current_visitor": pid})
 
 
+# -------- Body language (arms crossed) routed to current visitor --------------
+
+BODY_STATES = {"open", "crossed"}
+
+
+@app.post("/body")
+def post_body():
+    """Debounced arms-crossed signal from the POV MediaPipe PoseLandmarker.
+
+    Client sends transitions only (~0.5–1 Hz at most, not every frame), so we
+    can safely store each as a history entry without extra throttling here.
+    """
+    data = request.get_json(force=True)
+    state = (data.get("arms") or "").strip().lower()
+    if state not in BODY_STATES:
+        return jsonify({"ok": False, "error": "arms must be 'open' or 'crossed'"}), 400
+    pid = current_visitor
+    now = time.time()
+    if pid:
+        with state_lock:
+            v = vitals[pid]
+            v["arms_state"] = state
+            v["arms_history"].append({"ts": int(now * 1000), "state": state})
+            if state == "crossed":
+                v["arms_ts"] = now
+    return jsonify({"ok": True, "current_visitor": pid, "arms": state})
+
+
 # -------- Claude triage coach -------------------------------------------------
 
 TRIAGE_SYSTEM = (
@@ -695,6 +754,10 @@ TRIAGE_SYSTEM = (
     "Include a Receptionist action when their distress is sustained, session is "
     "long, or a simple patient-facing gesture would reduce everyone's stress "
     "(e.g., 'offer water to David', 'brief break — 20 min sustained focus').\n\n"
+    "Body-language signal: 'body: arms crossed' in a patient row means the POV "
+    "camera observed sustained crossed-arm posture — a mild guarding/discomfort "
+    "cue. Don't over-weight it on its own, but combine with emotion + wait "
+    "time to justify a check-in when present.\n\n"
     "Be concrete. No preamble, no summary, no extra text."
 )
 
@@ -710,10 +773,11 @@ def build_triage_context() -> str:
         emo_s = snap["emotion"] or "unknown"
         loc = snap["bay"]
         at_counter = " (AT COUNTER)" if pid == current_visitor else ""
+        body_flag = " | body: arms crossed" if snap.get("arms_active") else ""
         lines.append(
             f"- {snap['name']}, {snap['age']}{at_counter}: \"{snap['chief_complaint']}\" | "
             f"{loc}, waiting {wait_min:.1f} min | HR {hr_s} | anxiety {anx_lbl} "
-            f"({anx_metric}) | distress {snap['distress']:.2f} | emotion {emo_s}"
+            f"({anx_metric}) | distress {snap['distress']:.2f} | emotion {emo_s}{body_flag}"
         )
     r = receptionist_snapshot()
     lines.append("")
@@ -866,6 +930,15 @@ HTML = r"""<!doctype html>
 <title>HappyClinic · reception triage</title>
 <script defer src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
 <script src="https://unpkg.com/three@0.149.0/build/three.min.js"></script>
+<script type="module">
+  // MediaPipe Tasks Vision — powers emotion (FaceLandmarker blendshapes) and
+  // crossed-arms detection (PoseLandmarker). face-api.js stays loaded for
+  // faceRecognitionNet descriptors only (MediaPipe has no identity embedding).
+  import { FaceLandmarker, PoseLandmarker, FilesetResolver }
+    from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.34/vision_bundle.mjs";
+  window.__mp = { FaceLandmarker, PoseLandmarker, FilesetResolver };
+  window.dispatchEvent(new CustomEvent("mp-ready"));
+</script>
 <style>
   :root {
     --bg: #0b0d10; --panel: #14181d; --panel2:#191e25; --line: #222931;
@@ -1197,6 +1270,11 @@ HTML = r"""<!doctype html>
   .pov-stacked .video-wrap { aspect-ratio: 4/3; width: 100%; }
   .pov-stacked .cam-setup select { width: 100%; }
   .pov-meta-row { display: flex; gap: 6px; align-items: center; font-size: 10px; color: var(--mute); }
+  .arms-pill { padding: 2px 8px; border-radius: 10px; border: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  .arms-pill.crossed { background: rgba(255,123,114,0.15); border-color: var(--err); color: var(--err); }
+  .arms-pill.open    { color: var(--mute); }
+  .arms-pill.unknown { color: var(--faint); }
+  .pi-vitals-row .chip.arms-chip.crossed { background: rgba(255,123,114,0.1); border-color: var(--err); color: var(--err); }
 
   .queue { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px; }
   .patient-card {
@@ -1343,6 +1421,7 @@ HTML = r"""<!doctype html>
           <div class="pov-meta-row">
             <button id="cam-refresh" style="font-size:10px;padding:3px 8px;">↻ re-scan</button>
             <span id="cam-count">—</span>
+            <span id="arms-pill" class="arms-pill unknown" title="MediaPipe PoseLandmarker · crossed arms detected when both wrists cross the torso midline">arms: —</span>
           </div>
           <div class="claim-panel" id="claim-panel" style="display:none;">
             <div class="claim-title">⚠ unknown at counter</div>
@@ -1412,6 +1491,7 @@ const resetBtn = document.getElementById("reset-enroll");
 const videoRecep = document.getElementById("video-recep-big");
 const camPovSel = document.getElementById("cam-pov");
 const camRecepSel = document.getElementById("cam-recep");
+const armsPill = document.getElementById("arms-pill");
 const recepEmoji = document.getElementById("recep-emoji");
 const recepLabel = document.getElementById("recep-label");
 const recepSession = document.getElementById("recep-session");
@@ -1526,14 +1606,49 @@ document.getElementById("cam-refresh")?.addEventListener("click", async () => {
   await listCameras();
 });
 
-async function loadFaceApi() {
-  const MODELS = "https://justadudewhohacks.github.io/face-api.js/models";
-  await Promise.all([
-    faceapi.nets.tinyFaceDetector.loadFromUri(MODELS),
-    faceapi.nets.faceLandmark68Net.loadFromUri(MODELS),
-    faceapi.nets.faceRecognitionNet.loadFromUri(MODELS),
-    faceapi.nets.faceExpressionNet.loadFromUri(MODELS),
+// MediaPipe task handles (see scripted ESM loader at top of document).
+const MP_WASM     = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.34/wasm";
+const FACE_MODEL  = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+const POSE_MODEL  = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+let faceLandmarkerPov  = null;
+let faceLandmarkerRecep = null;
+let poseLandmarker     = null;
+
+async function loadModels() {
+  // face-api.js — kept only for faceRecognitionNet (128-D identity descriptors).
+  // tinyFaceDetector + faceLandmark68Net are prerequisites for descriptor
+  // extraction; faceExpressionNet is no longer loaded — emotion moved to MP.
+  const FACE_API_MODELS = "https://justadudewhohacks.github.io/face-api.js/models";
+  const faceApiP = Promise.all([
+    faceapi.nets.tinyFaceDetector.loadFromUri(FACE_API_MODELS),
+    faceapi.nets.faceLandmark68Net.loadFromUri(FACE_API_MODELS),
+    faceapi.nets.faceRecognitionNet.loadFromUri(FACE_API_MODELS),
   ]);
+
+  if (!window.__mp) {
+    await new Promise(res => window.addEventListener("mp-ready", res, { once: true }));
+  }
+  const { FaceLandmarker, PoseLandmarker, FilesetResolver } = window.__mp;
+  const vision = await FilesetResolver.forVisionTasks(MP_WASM);
+  const faceOpts = {
+    baseOptions: { modelAssetPath: FACE_MODEL, delegate: "GPU" },
+    outputFaceBlendshapes: true,
+    runningMode: "VIDEO",
+    numFaces: 1,
+  };
+  // Separate FaceLandmarker instances per video source — VIDEO mode expects
+  // monotonic timestamps per task, sharing across two videos can desync.
+  [faceLandmarkerPov, faceLandmarkerRecep] = await Promise.all([
+    FaceLandmarker.createFromOptions(vision, faceOpts),
+    FaceLandmarker.createFromOptions(vision, faceOpts),
+  ]);
+  poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+    baseOptions: { modelAssetPath: POSE_MODEL, delegate: "GPU" },
+    runningMode: "VIDEO",
+    numPoses: 1,
+  });
+
+  await faceApiP;
   dotFa.classList.add("on");
   ready = true;
 }
@@ -1576,13 +1691,83 @@ function drawBbox(detection, label, sub) {
   octx.restore();
 }
 
-function pickEmotion(expr) {
-  const map = { happy:"happy", sad:"sad", angry:"angry", surprised:"surprised",
-                fearful:"surprised", disgusted:"angry", neutral:"neutral" };
-  let top = "neutral", v = 0;
-  for (const [k, p] of Object.entries(expr)) { if (p > v) { v = p; top = k; } }
-  if (v < 0.35) return { label: "neutral", score: v };
-  return { label: map[top] || "neutral", score: v };
+// Blendshape -> emotion scorer. Ported from ~/projects/nano_hackathon/web/app.js
+// (MediaPipe FaceLandmarker outputs 52 ARKit-style blendshape coefficients
+// 0..1; these weighted sums are the hand-tuned mapping from that sketch).
+function scoreEmotions(bs) {
+  const v = (k) => bs[k] || 0;
+  const happy = (v("mouthSmileLeft") + v("mouthSmileRight")) / 2
+              + (v("cheekSquintLeft") + v("cheekSquintRight")) * 0.15;
+  const sad   = (v("mouthFrownLeft") + v("mouthFrownRight")) / 2
+              + v("browInnerUp") * 0.3;
+  const angryRaw = (v("browDownLeft") + v("browDownRight")) / 2
+                 + (v("noseSneerLeft") + v("noseSneerRight")) * 0.15;
+  // Gate: both inner brows need to be meaningfully down, otherwise a neutral
+  // face with mild asymmetry flickers into "angry".
+  const angry = (v("browDownLeft") > 0.4 && v("browDownRight") > 0.4) ? angryRaw : angryRaw * 0.25;
+  const surprised = (v("eyeWideLeft") + v("eyeWideRight")) / 2
+                  + v("jawOpen") * 0.3
+                  + (v("browOuterUpLeft") + v("browOuterUpRight")) * 0.15;
+  const scores = { happy, sad, angry, surprised };
+  const max = Math.max(...Object.values(scores));
+  const threshold = 0.25;
+  if (max <= threshold) return { label: "neutral", score: 1 - max };
+  let best = "neutral", bestV = 0;
+  for (const k of Object.keys(scores)) if (scores[k] > bestV) { bestV = scores[k]; best = k; }
+  return { label: best, score: bestV };
+}
+
+function blendshapesFromResult(result) {
+  if (!result || !result.faceBlendshapes || result.faceBlendshapes.length === 0) return null;
+  const bs = {};
+  for (const cat of result.faceBlendshapes[0].categories) bs[cat.categoryName] = cat.score;
+  return bs;
+}
+
+function bboxFromLandmarks(lm, vw, vh) {
+  if (!lm || !lm.length) return null;
+  let xmin = 1, ymin = 1, xmax = 0, ymax = 0;
+  for (const p of lm) {
+    if (p.x < xmin) xmin = p.x;
+    if (p.y < ymin) ymin = p.y;
+    if (p.x > xmax) xmax = p.x;
+    if (p.y > ymax) ymax = p.y;
+  }
+  return { x: xmin * vw, y: ymin * vh, width: (xmax - xmin) * vw, height: (ymax - ymin) * vh };
+}
+
+// MediaPipe Pose indices: 11 L-shoulder, 12 R-shoulder, 15 L-wrist, 16 R-wrist.
+// "left" is the subject's own left (i.e. camera-right when facing the camera).
+// Ported verbatim from nano_hackathon initial commit's detectArmsCrossed.
+function detectArmsCrossed(landmarks) {
+  if (!landmarks) return { crossed: false, confidence: 0 };
+  const Ls = landmarks[11], Rs = landmarks[12], Lw = landmarks[15], Rw = landmarks[16];
+  const minVis = Math.min(Ls?.visibility ?? 0, Rs?.visibility ?? 0, Lw?.visibility ?? 0, Rw?.visibility ?? 0);
+  if (minVis < 0.5) return { crossed: false, confidence: 0 };
+  const midX = (Ls.x + Rs.x) / 2;
+  const shoulderWidth = Math.abs(Ls.x - Rs.x);
+  const leftWristCrossed  = Lw.x < midX;    // subject-left wrist has moved past midline
+  const rightWristCrossed = Rw.x > midX;
+  const wristGap = Math.abs(Lw.x - Rw.x);
+  // Close-together wrists gate: arms flung open with wrists on opposite sides
+  // of the torso shouldn't register as "crossed".
+  const crossed = leftWristCrossed && rightWristCrossed && wristGap < shoulderWidth * 1.2;
+  return { crossed, confidence: minVis };
+}
+
+function updateArmsPill(state, conf) {
+  if (!armsPill) return;
+  armsPill.classList.remove("crossed", "open", "unknown");
+  if (state === "crossed") {
+    armsPill.classList.add("crossed");
+    armsPill.textContent = `arms: crossed${conf ? " · " + conf.toFixed(2) : ""}`;
+  } else if (state === "open") {
+    armsPill.classList.add("open");
+    armsPill.textContent = "arms: open";
+  } else {
+    armsPill.classList.add("unknown");
+    armsPill.textContent = "arms: —";
+  }
 }
 
 async function sendEmotion(label) {
@@ -1596,6 +1781,18 @@ async function sendEmotion(label) {
     const j = await r.json();
     dotEsp.classList.toggle("on", !!j.sent_serial);
     dotEsp.classList.toggle("off", !j.sent_serial);
+  } catch {}
+}
+
+let lastSentArms = null;
+async function sendBody(arms, confidence) {
+  if (arms === lastSentArms) return;
+  lastSentArms = arms;
+  try {
+    await fetch("/body", {
+      method: "POST", headers: {"content-type":"application/json"},
+      body: JSON.stringify({ arms, confidence: confidence ?? null }),
+    });
   } catch {}
 }
 
@@ -1676,21 +1873,26 @@ function updateClaimPanel(patients, current) {
   }
 }
 
+let lastRecepTs = -1;
 async function detectLoopReceptionist() {
-  if (!ready) { setTimeout(detectLoopReceptionist, 600); return; }
+  if (!ready || !faceLandmarkerRecep) { setTimeout(detectLoopReceptionist, 600); return; }
   if (!recepStream || videoRecep.readyState < 2) { setTimeout(detectLoopReceptionist, 800); return; }
   try {
-    const result = await faceapi
-      .detectSingleFace(videoRecep, new faceapi.TinyFaceDetectorOptions({ inputSize: 192, scoreThreshold: 0.5 }))
-      .withFaceExpressions();
-    if (result) {
-      const { label } = pickEmotion(result.expressions);
+    // MediaPipe VIDEO mode requires strictly monotonic timestamps per task;
+    // currentTime jumps via seeking/reload can go backward, so clamp.
+    let ts = Math.round((videoRecep.currentTime || 0) * 1000);
+    if (ts <= lastRecepTs) ts = lastRecepTs + 1;
+    lastRecepTs = ts;
+    const result = faceLandmarkerRecep.detectForVideo(videoRecep, ts);
+    const bs = blendshapesFromResult(result);
+    if (bs) {
+      const { label } = scoreEmotions(bs);
       fetch("/receptionist", {
         method: "POST", headers: {"content-type":"application/json"},
         body: JSON.stringify({ emotion: label }),
       }).catch(() => {});
     }
-  } catch {}
+  } catch (e) { /* occasional MP transient on track change — swallow */ }
   setTimeout(detectLoopReceptionist, 800);  // ~1.25 Hz
 }
 
@@ -1733,14 +1935,38 @@ function renderReceptionist(r) {
   }
 }
 
+// Arms-crossed debounce — state must hold for ARMS_DEBOUNCE_MS before we emit.
+const ARMS_DEBOUNCE_MS = 1500;
+const armsTrack = { stable: "unknown", pending: "unknown", pendingSince: 0, lastConf: 0 };
+let lastPovTs = -1;
+
 async function detectLoop() {
   if (!ready || video.readyState < 2) { requestAnimationFrame(detectLoop); return; }
 
-  const result = await faceapi
-    .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 }))
-    .withFaceLandmarks()
-    .withFaceExpressions()
-    .withFaceDescriptor();
+  let ts = Math.round((video.currentTime || 0) * 1000);
+  if (ts <= lastPovTs) ts = lastPovTs + 1;
+  lastPovTs = ts;
+
+  let emotionLabel = null;
+  let faceBox = null;
+  try {
+    const faceRes = faceLandmarkerPov.detectForVideo(video, ts);
+    const bs = blendshapesFromResult(faceRes);
+    if (bs) {
+      const m = scoreEmotions(bs);
+      emotionLabel = m.label;
+    }
+    if (faceRes?.faceLandmarks?.length) {
+      faceBox = bboxFromLandmarks(faceRes.faceLandmarks[0], video.videoWidth, video.videoHeight);
+    }
+  } catch {}
+
+  let armsDet = null;
+  try {
+    const poseRes = poseLandmarker.detectForVideo(video, ts);
+    const lm = poseRes?.landmarks?.[0];
+    if (lm) armsDet = detectArmsCrossed(lm);
+  } catch {}
 
   frameCount++;
   const now = performance.now();
@@ -1749,24 +1975,48 @@ async function detectLoop() {
     lastFpsAt = now; lastFpsCount = frameCount;
   }
 
-  if (result) {
-    lastDescriptor = result.descriptor;
+  if (emotionLabel) {
     lastFaceDetectedAt = Date.now();
-    const { label } = pickEmotion(result.expressions);
-    sendEmotion(label);
-    // Throttle descriptor sends to ~0.5 Hz
-    if (Date.now() - lastDescriptorAt > 2000) {
-      lastDescriptorAt = Date.now();
-      sendDescriptor(result.descriptor);
-    }
-    const matchLabel = faceMatchState.patientId
-      ? `${(knownName(faceMatchState.patientId) || "patient").toUpperCase()}`
-      : null;
-    drawBbox(result.detection, matchLabel, label);
-  } else {
-    drawBbox(null);
+    sendEmotion(emotionLabel);
   }
-  setTimeout(detectLoop, 400);
+
+  // Arms-crossed debounce: require the same state ≥1.5s before emitting.
+  const armsObserved = armsDet ? (armsDet.crossed ? "crossed" : "open") : "unknown";
+  if (armsObserved !== armsTrack.pending) {
+    armsTrack.pending = armsObserved;
+    armsTrack.pendingSince = now;
+    armsTrack.lastConf = armsDet?.confidence || 0;
+  } else if (armsObserved !== armsTrack.stable && now - armsTrack.pendingSince > ARMS_DEBOUNCE_MS) {
+    armsTrack.stable = armsObserved;
+    if (armsObserved === "crossed" || armsObserved === "open") {
+      sendBody(armsObserved, armsDet?.confidence);
+    }
+  }
+  updateArmsPill(armsTrack.stable, armsTrack.lastConf);
+
+  // Face recognition descriptor via face-api.js — throttled to ~0.5 Hz. This
+  // is the only reason face-api is still loaded; MediaPipe has no identity
+  // embedding and ripping out recognition would break /face + /claim.
+  if (Date.now() - lastDescriptorAt > 2000) {
+    lastDescriptorAt = Date.now();
+    try {
+      const r = await faceapi
+        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 }))
+        .withFaceLandmarks()
+        .withFaceDescriptor();
+      if (r) {
+        lastDescriptor = r.descriptor;
+        sendDescriptor(r.descriptor);
+      }
+    } catch {}
+  }
+
+  const matchLabel = faceMatchState.patientId
+    ? `${(knownName(faceMatchState.patientId) || "patient").toUpperCase()}`
+    : null;
+  drawBbox(faceBox ? { box: faceBox } : null, matchLabel, emotionLabel);
+
+  setTimeout(detectLoop, 120);   // ~8 Hz — MP runs on GPU, so this is cheap.
 }
 
 // --- Queue + visitor + vitals updates from /status ---
@@ -1863,6 +2113,7 @@ function renderPatientList(patients, current, badgeList) {
           <span class="chip">HRV <b>${escapeHtml(hrvTxt)}</b></span>
           <span class="chip">distress <b>${(p.distress ?? 0).toFixed(2)}</b></span>
           <span class="chip">emotion <b>${escapeHtml(p.emotion || "—")}</b></span>
+          <span class="chip arms-chip ${p.arms_active ? "crossed" : ""}">arms <b>${escapeHtml(p.arms || "—")}</b></span>
         </div>
         <div class="pi-grid">
           <div>age <b>${p.age}</b></div>
@@ -2356,7 +2607,7 @@ function animate3D(t) {
   await pollStatus();
   await startCamera();
   resizeOverlay();
-  await loadFaceApi();
+  await loadModels();
   scheduleNextTriage();
   detectLoop();
   detectLoopReceptionist();

@@ -15,8 +15,3 @@ __pycache__/
 # Intermediate / backup
 tools/*.bak.py
 tools/*.bak
-
-# Persisted face-recognition database (SQLite + WAL sidecars)
-tools/faces.db
-tools/faces.db-wal
-tools/faces.db-shm
