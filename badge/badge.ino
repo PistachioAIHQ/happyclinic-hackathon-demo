@@ -14,16 +14,18 @@
 #include <U8g2lib.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <ESPmDNS.h>
 
 // ---------------- Config (edit in place) -------------------------------------
 #define WIFI_SSID   "mixpanel-guest"
 #define WIFI_PASS   "analytics"
 
-// Flask dashboard host. Raw IP on the same 2.4 GHz network — here it's the
-// Windows host (172.16.23.107) with a netsh portproxy to the WSL2 Flask app.
-#define SERVER_HOST "172.16.23.107"
-#define SERVER_PORT 5050
+// Public ngrok endpoint for the dashboard. We use HTTPS plus ngrok's
+// device-safe skip-warning header so the badge can poll JSON without opening a
+// firewall port on the laptop.
+#define SERVER_HOST "status-sufferer-backlog.ngrok-free.dev"
+#define SERVER_PORT 443
 
 // Which patient this badge displays. Must match a key in tools/dashboard.py.
 #define PATIENT_ID  "mark"
@@ -201,15 +203,31 @@ static bool extractString(const String& src, const char* key, String* out) {
 
 static bool pollNPS() {
   if (!WiFi.isConnected()) return false;
+  WiFiClientSecure client;
+  client.setInsecure();  // Demo-only: accept ngrok's cert without CA pinning.
+  client.setTimeout(5000);
   HTTPClient http;
-  char url[160];
-  snprintf(url, sizeof(url), "http://%s:%d/%s/nps",
-           SERVER_HOST, SERVER_PORT, PATIENT_ID);
-  if (!http.begin(url)) { Serial.println("http begin failed"); return false; }
+  char path[64];
+  snprintf(path, sizeof(path), "/%s/nps", PATIENT_ID);
+
+  IPAddress resolved;
+  if (WiFi.hostByName(SERVER_HOST, resolved)) {
+    Serial.printf("dns: %s -> %s\n", SERVER_HOST, resolved.toString().c_str());
+  } else {
+    Serial.printf("dns: failed for %s\n", SERVER_HOST);
+  }
+
+  if (!http.begin(client, SERVER_HOST, SERVER_PORT, path, true)) {
+    Serial.println("http begin failed");
+    return false;
+  }
+  http.addHeader("ngrok-skip-browser-warning", "true");
+  http.setUserAgent("happyclinic-badge/1.0");
   http.setTimeout(2500);
   int code = http.GET();
   if (code != 200) {
-    Serial.printf("nps http=%d url=%s\n", code, url);
+    Serial.printf("nps http=%d err=%s host=%s path=%s\n",
+                  code, http.errorToString(code).c_str(), SERVER_HOST, path);
     http.end();
     return false;
   }
