@@ -1,8 +1,11 @@
-.pio
-.vscode/
+# Arduino build artifacts
+badge/build/
+*.elf
+*.bin
+*.hex
 
-# Secrets — local-only
-src/secrets.h
+# Editor
+.vscode/
 
 # Python / Mac
 __pycache__/
