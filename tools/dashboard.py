@@ -8,6 +8,8 @@ coach, which watches the whole waiting room and returns prioritized staff action
 import os
 import random
 import re
+import sqlite3
+import struct
 import threading
 import time
 from collections import deque
@@ -24,8 +26,19 @@ LISTEN_HOST = os.getenv("HAPPYCLINIC_LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.getenv("HAPPYCLINIC_LISTEN_PORT", "5050"))
 BADGE_ID = os.getenv("HAPPYCLINIC_BADGE_ID", "badge-1")
 BADGE_LABEL = os.getenv("HAPPYCLINIC_BADGE_LABEL", "waiting room badge")
-BADGE_DEFAULT_PATIENT = os.getenv("HAPPYCLINIC_BADGE_PATIENT", "mark")
+BADGE_DEFAULT_PATIENT = os.getenv("HAPPYCLINIC_BADGE_PATIENT", "david")
 FACE_MATCH_THRESHOLD = 0.55    # euclidean distance — 0.4 strict, 0.6 forgiving
+# Face-descriptor persistence (SQLite).
+FACE_DB_PATH = os.getenv(
+    "HAPPYCLINIC_FACE_DB",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "faces.db"),
+)
+# Adaptive learning: when a live match is more confident than this, store the
+# new descriptor as an additional sample so a returning patient is recognized
+# faster and more accurately next time.
+FACE_LEARN_DISTANCE = 0.40
+FACE_LEARN_INTERVAL_S = 20.0   # per-patient cooldown between auto-captured samples
+FACE_MAX_SAMPLES = 25          # cap samples per patient
 SESSION_START = time.time()
 
 EMOTIONS = ["happy", "sad", "angry", "surprised", "neutral"]
@@ -33,9 +46,9 @@ EMOTIONS = ["happy", "sad", "angry", "surprised", "neutral"]
 # -------- Patient roster (seeded) ---------------------------------------------
 
 PATIENTS: dict[str, dict] = {
-    "ana": {
-        "id": "ana",
-        "name": "Ana Ortiz",
+    "ciaran": {
+        "id": "ciaran",
+        "name": "Ciaran Murphy",
         "age": 34,
         "chief_complaint": "Persistent cough, fever 3 days",
         "allergies": "penicillin",
@@ -44,12 +57,13 @@ PATIENTS: dict[str, dict] = {
         "bay": "front desk",
         "vitals_source": "real",    # fed by ESP32/Garmin serial
         "checked_in": None,         # set when their face is first enrolled
-        "descriptor": None,
+        "descriptors": [],          # list of 128-float face samples (persisted in SQLite)
     },
-    "mark": {
-        "id": "mark",
-        "name": "Mark Chen",
-        "age": 52,
+    "david": {
+        "id": "david",
+        "name": "David Hardin",
+        "age": 38,
+        "sex": "male",
         "chief_complaint": "Sharp chest pain, shortness of breath",
         "allergies": "shellfish",
         "meds": "atorvastatin, aspirin 81mg",
@@ -57,7 +71,7 @@ PATIENTS: dict[str, dict] = {
         "bay": "bay 2",
         "vitals_source": "sim_anxious",
         "checked_in": time.time() - 60 * 9,   # 9 min into wait at boot
-        "descriptor": None,
+        "descriptors": [],
     },
     "priya": {
         "id": "priya",
@@ -70,7 +84,7 @@ PATIENTS: dict[str, dict] = {
         "bay": "bay 1",
         "vitals_source": "sim_normal",
         "checked_in": time.time() - 60 * 3,   # 3 min into wait at boot
-        "descriptor": None,
+        "descriptors": [],
     },
 }
 
@@ -145,7 +159,7 @@ def write_serial(cmd: str) -> bool:
             return False
 
 
-# -------- Real vitals: ESP32/Garmin -> "ana" ----------------------------------
+# -------- Real vitals: ESP32/Garmin -> "ciaran" -------------------------------
 
 def serial_reader() -> None:
     buf = b""
@@ -169,7 +183,7 @@ def serial_reader() -> None:
                     hr = int(text.split(":", 1)[1])
                     now = time.time()
                     with state_lock:
-                        v = vitals["ana"]
+                        v = vitals["ciaran"]
                         v["hr"] = hr
                         v["hr_ts"] = now
                         if not v["hr_history"] or now - v["hr_history"][-1][0] >= 1.0:
@@ -180,7 +194,7 @@ def serial_reader() -> None:
                 try:
                     now = time.time()
                     with state_lock:
-                        rrs = vitals["ana"]["rr_samples"]
+                        rrs = vitals["ciaran"]["rr_samples"]
                         for part in text[3:].split(","):
                             rr = int(part.strip())
                             if 300 <= rr <= 2000:
@@ -340,13 +354,14 @@ def patient_snapshot(pid: str) -> dict:
         "id": p["id"],
         "name": p["name"],
         "age": p["age"],
+        "sex": p.get("sex"),
         "chief_complaint": p["chief_complaint"],
         "allergies": p["allergies"],
         "meds": p["meds"],
         "last_visit": p["last_visit"],
         "bay": p["bay"],
         "vitals_source": p["vitals_source"],
-        "enrolled": p["descriptor"] is not None,
+        "enrolled": bool(p["descriptors"]),
         "checked_in": p["checked_in"],
         "wait_s": wait,
         "hr": hr_fresh,
@@ -397,23 +412,165 @@ def badge_snapshot(badge_id: str) -> dict:
 
 
 # -------- Face recognition ----------------------------------------------------
+#
+# Descriptors are 128-float face-api.js embeddings. We keep one or more samples
+# per patient (list on PATIENTS[pid]["descriptors"]) and persist them to a
+# SQLite file so enrollments survive restarts and recognition gets progressively
+# faster/tighter as more samples accumulate.
+
+# Auto-captured sample bookkeeping (per-patient cooldown for adaptive learning).
+_last_auto_learn: dict[str, float] = {}
+face_db_lock = threading.Lock()
+
+
+def _pack_descriptor(desc: list[float]) -> bytes:
+    """Pack a 128-float descriptor as compact little-endian float32 bytes."""
+    return struct.pack("<128f", *desc)
+
+
+def _unpack_descriptor(blob: bytes) -> list[float]:
+    if len(blob) != 128 * 4:
+        raise ValueError(f"bad descriptor blob: {len(blob)} bytes")
+    return list(struct.unpack("<128f", blob))
+
+
+def _face_db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(FACE_DB_PATH, timeout=5.0, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+def init_face_db() -> None:
+    """Create schema (if needed) and load persisted descriptors into memory."""
+    with face_db_lock:
+        conn = _face_db_connect()
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS face_descriptors (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    patient_id  TEXT    NOT NULL,
+                    descriptor  BLOB    NOT NULL,
+                    source      TEXT    NOT NULL DEFAULT 'claim',
+                    created_at  REAL    NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_face_patient ON face_descriptors(patient_id)"
+            )
+            rows = conn.execute(
+                "SELECT patient_id, descriptor FROM face_descriptors ORDER BY id ASC"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    loaded: dict[str, int] = {}
+    with state_lock:
+        for pid, blob in rows:
+            if pid not in PATIENTS:
+                continue
+            try:
+                PATIENTS[pid]["descriptors"].append(_unpack_descriptor(blob))
+            except ValueError:
+                continue
+            loaded[pid] = loaded.get(pid, 0) + 1
+            if PATIENTS[pid]["checked_in"] is None:
+                PATIENTS[pid]["checked_in"] = time.time()
+    if loaded:
+        summary = ", ".join(f"{pid}:{n}" for pid, n in loaded.items())
+        print(f"  face db: loaded samples from {FACE_DB_PATH} ({summary})")
+    else:
+        print(f"  face db: no persisted samples yet ({FACE_DB_PATH})")
+
+
+def _db_insert_descriptor(pid: str, desc: list[float], source: str) -> None:
+    with face_db_lock:
+        conn = _face_db_connect()
+        try:
+            conn.execute(
+                "INSERT INTO face_descriptors (patient_id, descriptor, source, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (pid, _pack_descriptor(desc), source, time.time()),
+            )
+        finally:
+            conn.close()
+
+
+def _db_prune_patient(pid: str, keep: int) -> None:
+    """Keep only the most recent `keep` rows for patient `pid`."""
+    with face_db_lock:
+        conn = _face_db_connect()
+        try:
+            conn.execute(
+                """
+                DELETE FROM face_descriptors
+                 WHERE patient_id = ?
+                   AND id NOT IN (
+                       SELECT id FROM face_descriptors
+                        WHERE patient_id = ?
+                        ORDER BY id DESC
+                        LIMIT ?
+                   )
+                """,
+                (pid, pid, keep),
+            )
+        finally:
+            conn.close()
+
+
+def _db_clear_all() -> None:
+    with face_db_lock:
+        conn = _face_db_connect()
+        try:
+            conn.execute("DELETE FROM face_descriptors")
+        finally:
+            conn.close()
+
 
 def euclid(a: list[float], b: list[float]) -> float:
     return sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
 
 
 def match_descriptor(desc: list[float]) -> Optional[dict]:
+    """Find the closest stored sample across all patients' descriptor lists."""
     best_pid, best_d = None, 9.0
     with state_lock:
         for pid, p in PATIENTS.items():
-            if p["descriptor"] is None:
-                continue
-            d = euclid(desc, p["descriptor"])
-            if d < best_d:
-                best_d = d; best_pid = pid
+            for sample in p["descriptors"]:
+                d = euclid(desc, sample)
+                if d < best_d:
+                    best_d = d
+                    best_pid = pid
     if best_pid and best_d < FACE_MATCH_THRESHOLD:
         return {"patient_id": best_pid, "distance": round(best_d, 3)}
     return None
+
+
+def _maybe_auto_learn(pid: str, desc: list[float], distance: float) -> bool:
+    """Append a high-confidence live match as an extra persisted sample.
+
+    Keeps at most FACE_MAX_SAMPLES per patient (oldest pruned) so the DB stays
+    bounded while recognition gets tighter over repeated visits.
+    """
+    if distance >= FACE_LEARN_DISTANCE:
+        return False
+    now = time.time()
+    if now - _last_auto_learn.get(pid, 0.0) < FACE_LEARN_INTERVAL_S:
+        return False
+    with state_lock:
+        PATIENTS[pid]["descriptors"].append(desc)
+        if len(PATIENTS[pid]["descriptors"]) > FACE_MAX_SAMPLES:
+            PATIENTS[pid]["descriptors"] = PATIENTS[pid]["descriptors"][-FACE_MAX_SAMPLES:]
+    _last_auto_learn[pid] = now
+    try:
+        _db_insert_descriptor(pid, desc, source="auto")
+        _db_prune_patient(pid, FACE_MAX_SAMPLES)
+    except sqlite3.Error as e:
+        print(f"  face db: auto-learn insert failed for {pid}: {e}")
+        return False
+    return True
 
 
 @app.post("/face")
@@ -431,6 +588,7 @@ def post_face():
         with state_lock:
             vitals[pid]["last_seen_ts"] = time.time()
         current_visitor = pid
+        _maybe_auto_learn(pid, desc, match["distance"])
     else:
         # Face present but unknown — clear current visitor so UI shows claim prompt.
         # Don't wipe a previous match immediately — only if the face persistently
@@ -452,10 +610,17 @@ def post_claim():
     if not desc or len(desc) != 128:
         return jsonify({"ok": False, "error": "bad descriptor"}), 400
     with state_lock:
-        PATIENTS[pid]["descriptor"] = desc
+        PATIENTS[pid]["descriptors"].append(desc)
+        if len(PATIENTS[pid]["descriptors"]) > FACE_MAX_SAMPLES:
+            PATIENTS[pid]["descriptors"] = PATIENTS[pid]["descriptors"][-FACE_MAX_SAMPLES:]
         if PATIENTS[pid]["checked_in"] is None:
             PATIENTS[pid]["checked_in"] = time.time()
         vitals[pid]["last_seen_ts"] = time.time()
+    try:
+        _db_insert_descriptor(pid, desc, source="claim")
+        _db_prune_patient(pid, FACE_MAX_SAMPLES)
+    except sqlite3.Error as e:
+        print(f"  face db: claim insert failed for {pid}: {e}")
     current_visitor = pid
     return jsonify({"ok": True, "patient_id": pid, "name": PATIENTS[pid]["name"]})
 
@@ -480,7 +645,12 @@ def post_reset():
     global current_visitor
     with state_lock:
         for p in PATIENTS.values():
-            p["descriptor"] = None
+            p["descriptors"] = []
+    _last_auto_learn.clear()
+    try:
+        _db_clear_all()
+    except sqlite3.Error as e:
+        print(f"  face db: reset failed: {e}")
     current_visitor = None
     return jsonify({"ok": True})
 
@@ -524,7 +694,7 @@ TRIAGE_SYSTEM = (
     "  LOW   -> routine, calm, recent check-in\n\n"
     "Include a Receptionist action when their distress is sustained, session is "
     "long, or a simple patient-facing gesture would reduce everyone's stress "
-    "(e.g., 'offer water to Mark', 'brief break — 20 min sustained focus').\n\n"
+    "(e.g., 'offer water to David', 'brief break — 20 min sustained focus').\n\n"
     "Be concrete. No preamble, no summary, no extra text."
 )
 
@@ -2555,6 +2725,7 @@ setInterval(poll, 1000);
 
 
 if __name__ == "__main__":
+    init_face_db()
     open_serial()
     threading.Thread(target=serial_reader, daemon=True).start()
     for pid, p in PATIENTS.items():

@@ -68,7 +68,7 @@ For the badge sketch, set:
 
 - `WIFI_SSID` / `WIFI_PASS` to your real network
 - `SERVER_HOST` to your **Windows machine's LAN IP**
-- `PATIENT_ID` to one of `ana`, `mark`, or `priya`
+- `PATIENT_ID` to one of `ciaran`, `david`, or `priya`
 
 ### Option B: keep Flask in WSL
 
@@ -113,7 +113,7 @@ On the iPhone (for the POV camera): **Settings → General → AirPlay & Handoff
 1. **Hook** — "Urgent care reception is chaos. The receptionist is the single point of failure."
 2. **Split the screen** — point to the two column headers. Left = staff wellbeing. Right = patient triage.
 3. **Walk the right column 1→4** — stats → 3D → POV → patient records.
-4. **Click "run triage now"** — Claude reads every patient's vitals, the receptionist's state, and returns prioritized actions. `[HIGH] Mark Chen: escort immediately — chest pain + SOB.` If the receptionist is stressed, it also generates a staff-facing action.
+4. **Click "run triage now"** — Claude reads every patient's vitals, the receptionist's state, and returns prioritized actions. `[HIGH] David Hardin: escort immediately — chest pain + SOB.` If the receptionist is stressed, it also generates a staff-facing action.
 5. **Close** — "We don't just watch patients. We guide staff. That's the proactive layer urgent care is missing."
 
 ## Architecture
@@ -130,8 +130,8 @@ Example response:
 
 ```json
 {
-  "id": "mark",
-  "name": "Mark Chen",
+  "id": "david",
+  "name": "David Hardin",
   "score": 1,
   "distress": 0.84,
   "anxiety": "elevated",

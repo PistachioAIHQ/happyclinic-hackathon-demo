@@ -45,7 +45,7 @@ No test runner or linter is configured.
 
 **Heart rendering.** `drawHeartFilled` / `drawHeartOutline` / `drawBrokenHeart` build hearts out of U8g2 primitives (two `drawDisc` humps + `drawTriangle` body). `drawBrokenHeart` draws a full heart then uses `setDrawColor(0)` to erase a zigzag crack down the middle.
 
-**Patient model (`tools/dashboard.py`).** `PATIENTS` dict near the top is the seeded roster. Each entry has a `vitals_source`: `"real"` means ESP32 serial feeds HR/RR (legacy BLE-relay path — inert on the badge branch since the sketch no longer writes to serial), and `sim_anxious` / `sim_normal` means a `simulate_patient` thread drives it using a profile from `SIM_PROFILES`. `mark` with `sim_anxious` reliably reaches `score == 0` during its emotion cycle, which is why it's the default badge target.
+**Patient model (`tools/dashboard.py`).** `PATIENTS` dict near the top is the seeded roster. Each entry has a `vitals_source`: `"real"` means ESP32 serial feeds HR/RR (legacy BLE-relay path — inert on the badge branch since the sketch no longer writes to serial), and `sim_anxious` / `sim_normal` means a `simulate_patient` thread drives it using a profile from `SIM_PROFILES`. `david` with `sim_anxious` reliably reaches `score == 0` during its emotion cycle, which is why it's the default badge target.
 
 **Anxiety classification.** `hrv_rmssd()` prefers true RMSSD from RR intervals and falls back to HR stdev as a *proxy* (flagged with `proxy: true` in the UI). Garmin Broadcast HR only emits RR while an activity is running on most models.
 
