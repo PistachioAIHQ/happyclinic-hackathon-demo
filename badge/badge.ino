@@ -20,9 +20,9 @@
 #define WIFI_SSID   "mixpanel-guest"
 #define WIFI_PASS   "analytics"
 
-// Flask dashboard host. Use your Mac's Bonjour name (<hostname>.local) or a
-// raw IP on the same 2.4 GHz network.
-#define SERVER_HOST "happyclinic.local"
+// Flask dashboard host. Raw IP on the same 2.4 GHz network — here it's the
+// Windows host (172.16.23.107) with a netsh portproxy to the WSL2 Flask app.
+#define SERVER_HOST "172.16.23.107"
 #define SERVER_PORT 5050
 
 // Which patient this badge displays. Must match a key in tools/dashboard.py.

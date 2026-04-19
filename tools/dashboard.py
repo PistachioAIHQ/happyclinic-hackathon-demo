@@ -5,6 +5,7 @@ Real visitor (face-matched, auto-enrolled on first sight) streams vitals from th
 ESP32 + Garmin. Two simulated patients add realistic context for Claude's triage
 coach, which watches the whole waiting room and returns prioritized staff actions.
 """
+import os
 import random
 import re
 import threading
@@ -16,9 +17,11 @@ from anthropic import Anthropic
 from flask import Flask, Response, jsonify, request
 import serial
 
-PORT = "/dev/cu.usbserial-0001"
-BAUD = 115200
-MODEL = "claude-sonnet-4-6"
+PORT = os.getenv("HAPPYCLINIC_SERIAL_PORT", "/dev/cu.usbserial-0001")
+BAUD = int(os.getenv("HAPPYCLINIC_SERIAL_BAUD", "115200"))
+MODEL = os.getenv("HAPPYCLINIC_MODEL", "claude-sonnet-4-6")
+LISTEN_HOST = os.getenv("HAPPYCLINIC_LISTEN_HOST", "0.0.0.0")
+LISTEN_PORT = int(os.getenv("HAPPYCLINIC_LISTEN_PORT", "5050"))
 FACE_MATCH_THRESHOLD = 0.55    # euclidean distance — 0.4 strict, 0.6 forgiving
 SESSION_START = time.time()
 
@@ -2448,7 +2451,10 @@ if __name__ == "__main__":
             threading.Thread(
                 target=simulate_patient, args=(pid, p["vitals_source"]), daemon=True
             ).start()
-    print(f"\n  HappyClinic reception ready: http://0.0.0.0:5050  (LAN-reachable for ESP32 badge)")
+    print(
+        f"\n  HappyClinic reception ready: http://{LISTEN_HOST}:{LISTEN_PORT}"
+        "  (bind host configurable via HAPPYCLINIC_LISTEN_HOST)"
+    )
     print(f"  patients seeded: {', '.join(p['name'] for p in PATIENTS.values())}")
-    print(f"  triage model: {MODEL}, serial: {'ok' if ser else 'offline'}\n")
-    app.run(host="0.0.0.0", port=5050, debug=False)
+    print(f"  triage model: {MODEL}, serial port: {PORT}, serial: {'ok' if ser else 'offline'}\n")
+    app.run(host=LISTEN_HOST, port=LISTEN_PORT, debug=False)
