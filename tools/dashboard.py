@@ -24,6 +24,61 @@ SESSION_START = time.time()
 
 EMOTIONS = ["happy", "sad", "angry", "surprised", "neutral"]
 
+# -------- NPS satisfaction prediction (hardcoded for demo) --------------------
+
+NPS_INTERVENTIONS = [
+    {"action": "Add triage nurse",       "delta": 18, "when": "wait_gt_10"},
+    {"action": "Comm coaching",          "delta": 12, "when": "always"},
+    {"action": "Standardized discharge", "delta":  8, "when": "always"},
+    {"action": "Comfort rounding",       "delta":  6, "when": "distress_gt_04"},
+    {"action": "Give refreshment",      "delta":  4, "when": "wait_gt_5"},
+]
+
+
+def compute_nps(snap: dict) -> int | None:
+    """Plausible NPS from patient snapshot. Returns -100..+100."""
+    try:
+        score = 60.0
+        wait_m = (snap.get("wait_s") or 0) / 60.0
+        score -= wait_m * 3
+        if wait_m > 10:
+            score -= (wait_m - 10) * 2
+        anx = (snap.get("anxiety") or {}).get("label", "calm")
+        score -= {"calm": 0, "balanced": 15, "elevated": 30}.get(anx, 10)
+        score -= (snap.get("distress") or 0) * 25
+        emo = snap.get("emotion") or "neutral"
+        score += {"happy": 10, "neutral": 0, "sad": -10, "angry": -20, "surprised": -5}.get(emo, 0)
+        return max(-100, min(100, int(round(score))))
+    except Exception:
+        return None
+
+
+def top_intervention(snap: dict) -> dict | None:
+    """Return the best applicable intervention for a patient snapshot."""
+    ivs = all_interventions(snap)
+    return ivs[0] if ivs else None
+
+
+def all_interventions(snap: dict) -> list[dict]:
+    """Return all applicable interventions with projected NPS, sorted by delta desc."""
+    nps = snap.get("nps")
+    if nps is None:
+        return []
+    wait_m = (snap.get("wait_s") or 0) / 60.0
+    distress = snap.get("distress") or 0
+    out = []
+    for iv in NPS_INTERVENTIONS:
+        w = iv["when"]
+        if w == "always" or (w == "wait_gt_10" and wait_m > 10) or (w == "wait_gt_5" and wait_m > 5) or (w == "distress_gt_04" and distress > 0.4):
+            out.append({
+                "action": iv["action"],
+                "delta": iv["delta"],
+                "projected": min(100, nps + iv["delta"]),
+            })
+    out.sort(key=lambda x: -x["delta"])
+    return out
+
+
 # -------- Patient roster (seeded) ---------------------------------------------
 
 PATIENTS: dict[str, dict] = {
@@ -78,6 +133,7 @@ def _blank_vitals() -> dict:
         "emotion_history": deque(maxlen=200),      # {ts, emotion}
         "last_seen_ts": None,
         "rr_samples": deque(maxlen=600),           # (ts, rr_ms)
+        "nps_history": deque(maxlen=180),          # (ts, nps) ~3 min at 1 Hz
     }
 
 vitals: dict[str, dict] = {pid: _blank_vitals() for pid in PATIENTS}
@@ -326,7 +382,7 @@ def patient_snapshot(pid: str) -> dict:
         history_pts = len(v["hr_history"])
         hr_series = list(v["hr_history"])[-180:]
     hr_fresh = hr if hr_ts and time.time() - hr_ts < 10 else None
-    return {
+    result = {
         "id": p["id"],
         "name": p["name"],
         "age": p["age"],
@@ -348,6 +404,19 @@ def patient_snapshot(pid: str) -> dict:
         "history_pts": history_pts,
         "last_seen_s": round(time.time() - last_seen, 1) if last_seen else None,
     }
+    nps = compute_nps(result)
+    result["nps"] = nps
+    result["nps_interventions"] = all_interventions(result)
+    # Record NPS history (throttle to ~1 Hz)
+    if nps is not None:
+        now = time.time()
+        hist = vitals[pid]["nps_history"]
+        if not hist or now - hist[-1][0] >= 1.0:
+            hist.append((now, nps))
+    with state_lock:
+        nps_series = list(vitals[pid]["nps_history"])[-180:]
+    result["nps_series"] = [[int(t * 1000), n] for (t, n) in nps_series]
+    return result
 
 
 # -------- Face recognition ----------------------------------------------------
@@ -494,10 +563,15 @@ def build_triage_context() -> str:
         emo_s = snap["emotion"] or "unknown"
         loc = snap["bay"]
         at_counter = " (AT COUNTER)" if pid == current_visitor else ""
+        nps = snap.get("nps")
+        nps_s = f"NPS {nps}" if nps is not None else "NPS —"
+        iv = top_intervention(snap)
+        iv_s = f" (top: {iv['action']} → +{iv['delta']})" if iv else ""
         lines.append(
             f"- {snap['name']}, {snap['age']}{at_counter}: \"{snap['chief_complaint']}\" | "
             f"{loc}, waiting {wait_min:.1f} min | HR {hr_s} | anxiety {anx_lbl} "
-            f"({anx_metric}) | distress {snap['distress']:.2f} | emotion {emo_s}"
+            f"({anx_metric}) | distress {snap['distress']:.2f} | emotion {emo_s} | "
+            f"{nps_s}{iv_s}"
         )
     r = receptionist_snapshot()
     lines.append("")
@@ -567,11 +641,13 @@ def status():
     # Aggregate waiting-room stats
     waits = [p["wait_s"] for p in snaps if p["wait_s"] is not None]
     urgent = sum(1 for p in snaps if p["anxiety"] and p["anxiety"]["label"] == "elevated")
+    nps_vals = [p["nps"] for p in snaps if p["nps"] is not None]
     stats = {
         "count_waiting": len(waits),
         "avg_wait_s": round(sum(waits) / len(waits), 1) if waits else None,
         "max_wait_s": round(max(waits), 1) if waits else None,
         "count_elevated": urgent,
+        "avg_nps": round(sum(nps_vals) / len(nps_vals)) if nps_vals else None,
     }
     return jsonify({
         "now_ms": int(time.time() * 1000),
@@ -866,13 +942,38 @@ HTML = r"""<!doctype html>
   .recep-pill-overlay { position: absolute; bottom: 8px; left: 10px; background: rgba(0,0,0,0.6); padding: 4px 10px; font-size: 11px; border-radius: 12px; }
 
   /* Stats row */
-  .stats-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
   .stat-tile { border: 1px solid var(--line); background: var(--panel); padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; }
   .stat-tile .stat-label { font-size: 9px; color: var(--mute); letter-spacing: 0.1em; text-transform: uppercase; }
   .stat-tile .stat-value { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.1; }
   .stat-tile.urgent .stat-value { color: var(--err); }
   .stat-tile.waiting .stat-value { color: var(--claude); }
+  .stat-tile.nps .stat-value { color: #d2a8ff; }
   .stat-tile .stat-sub { font-size: 10px; color: var(--mute); }
+  .pill.nps-green  { background: rgba(126,231,135,0.22); color: #7ee787; }
+  .pill.nps-yellow { background: rgba(240,136,62,0.22); color: #f0883e; }
+  .pill.nps-red    { background: rgba(255,123,114,0.22); color: #ff7b72; }
+  /* NPS row: sparkline left, interventions right */
+  .nps-row { display: grid; grid-template-columns: 2fr 1fr; gap: 10px; margin-top: 6px; align-items: start; }
+  .nps-chart-wrap { }
+  .nps-chart-wrap .nps-chart-label { font-size: 9px; color: var(--mute); letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 2px; }
+  .nps-chart-wrap canvas { width: 100%; height: 64px; display: block; border-radius: 2px; background: var(--bg); border: 1px solid var(--line); }
+
+  /* NPS intervention panel */
+  .nps-iv-panel { display: flex; flex-direction: column; gap: 4px; }
+  .nps-iv-panel .nps-iv-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 1px; }
+  .nps-iv-panel .nps-iv-title { font-size: 9px; color: var(--mute); letter-spacing: 0.08em; text-transform: uppercase; }
+  .nps-iv-panel .nps-iv-current { font-size: 10px; color: var(--mute); }
+  .nps-iv-panel .nps-iv-current b { color: var(--text); font-weight: 600; }
+  .nps-iv-row { display: grid; grid-template-columns: 1fr auto; gap: 6px; align-items: center; font-size: 11px; }
+  .nps-iv-row .iv-top { display: flex; justify-content: space-between; align-items: baseline; grid-column: 1 / -1; }
+  .nps-iv-row .iv-label { color: var(--text); font-size: 10px; }
+  .nps-iv-row .iv-delta { color: #7ee787; font-weight: 600; font-size: 10px; font-variant-numeric: tabular-nums; }
+  .nps-iv-row .iv-bar-track { height: 10px; background: var(--bg); border: 1px solid var(--line); border-radius: 2px; position: relative; overflow: hidden; grid-column: 1 / -1; }
+  .nps-iv-row .iv-bar-current { position: absolute; top: 0; left: 0; height: 100%; background: rgba(255,255,255,0.06); }
+  .nps-iv-row .iv-bar-delta { position: absolute; top: 0; height: 100%; background: rgba(126,231,135,0.35); border-left: 2px solid #7ee787; }
+  .nps-iv-row .iv-bar-projected-marker { position: absolute; top: -1px; width: 2px; height: calc(100% + 2px); background: #7ee787; }
+  .nps-iv-row .iv-projected-label { position: absolute; top: -1px; right: 3px; height: 100%; display: flex; align-items: center; font-size: 8px; font-weight: 600; color: #7ee787; }
 
   /* Patient accordion list */
   .patient-list { display: flex; flex-direction: column; gap: 6px; }
@@ -1048,6 +1149,11 @@ HTML = r"""<!doctype html>
           <div class="stat-value" id="stat-urgent">—</div>
           <div class="stat-sub">needs priority attention</div>
         </div>
+        <div class="stat-tile nps">
+          <div class="stat-label">avg NPS</div>
+          <div class="stat-value" id="stat-nps">—</div>
+          <div class="stat-sub" id="stat-nps-sub">satisfaction forecast</div>
+        </div>
       </div>
     </div>
 
@@ -1162,6 +1268,8 @@ const statWaitingSub = document.getElementById("stat-waiting-sub");
 const statAvg = document.getElementById("stat-avg");
 const statMaxSub = document.getElementById("stat-max-sub");
 const statUrgent = document.getElementById("stat-urgent");
+const statNps = document.getElementById("stat-nps");
+const statNpsSub = document.getElementById("stat-nps-sub");
 const patientListEl = document.getElementById("patient-list");
 
 const EMOJIS = { happy:"😊", sad:"😢", angry:"😠", surprised:"😮", neutral:"😐" };
@@ -1505,8 +1613,113 @@ function renderStats(stats, patients) {
   statAvg.textContent = stats.avg_wait_s != null ? fmtWait(stats.avg_wait_s) : "—";
   statMaxSub.textContent = stats.max_wait_s != null ? `longest ${fmtWait(stats.max_wait_s)}` : "";
   statUrgent.textContent = stats.count_elevated ?? 0;
-  // Toggle urgent emphasis
   document.querySelector(".stat-tile.urgent").style.opacity = (stats.count_elevated > 0) ? 1 : 0.55;
+  // NPS tile
+  if (stats.avg_nps != null) {
+    statNps.textContent = (stats.avg_nps > 0 ? "+" : "") + stats.avg_nps;
+    statNpsSub.textContent = stats.avg_nps >= 50 ? "promoter zone" : stats.avg_nps >= 0 ? "passive zone" : "detractor zone";
+  } else {
+    statNps.textContent = "—";
+    statNpsSub.textContent = "satisfaction forecast";
+  }
+}
+
+function drawNpsSparkline(canvas, series) {
+  // series: [[ts_ms, nps], ...]
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  const W = rect.width, H = rect.height;
+  const pad = {l: 28, r: 6, t: 6, b: 6};
+
+  const ts = series.map(d => d[0]);
+  const vals = series.map(d => d[1]);
+  const t0 = ts[0], t1 = ts[ts.length - 1];
+  // Auto-scale y-axis to data range with padding
+  const vmin = Math.min(...vals), vmax = Math.max(...vals);
+  const vspan = Math.max(vmax - vmin, 4);  // at least 4 pts range to avoid flat line
+  const ymin = vmin - vspan * 0.15, ymax = vmax + vspan * 0.15;
+  const px = t => pad.l + ((t - t0) / Math.max(1, t1 - t0)) * (W - pad.l - pad.r);
+  const py = v => pad.t + ((ymax - v) / (ymax - ymin)) * (H - pad.t - pad.b);
+
+  // Top/bottom range labels
+  ctx.fillStyle = "rgba(255,255,255,0.2)";
+  ctx.font = "8px monospace";
+  ctx.textAlign = "right";
+  ctx.fillText((vmax > 0 ? "+" : "") + vmax, pad.l - 3, pad.t + 7);
+  ctx.fillText((vmin > 0 ? "+" : "") + vmin, pad.l - 3, H - pad.b);
+
+  const lastNps = vals[vals.length - 1];
+  const GREEN = "#7ee787", RED = "#ff7b72";
+  const GREEN_A = "rgba(126,231,135,", RED_A = "rgba(255,123,114,";
+  const LARGE_DELTA = 5;  // NPS change threshold for "large change" marker
+
+  // Draw segment-colored area fills + line (green=rising, red=falling)
+  ctx.lineWidth = 1.5;
+  ctx.lineJoin = "round";
+  for (let i = 1; i < ts.length; i++) {
+    const rising = vals[i] >= vals[i - 1];
+    const col = rising ? GREEN : RED;
+    const colA = rising ? GREEN_A : RED_A;
+    // Area fill for this segment
+    ctx.beginPath();
+    ctx.moveTo(px(ts[i - 1]), py(ymin));
+    ctx.lineTo(px(ts[i - 1]), py(vals[i - 1]));
+    ctx.lineTo(px(ts[i]), py(vals[i]));
+    ctx.lineTo(px(ts[i]), py(ymin));
+    ctx.closePath();
+    ctx.fillStyle = colA + "0.10)";
+    ctx.fill();
+    // Line segment
+    ctx.strokeStyle = col;
+    ctx.beginPath();
+    ctx.moveTo(px(ts[i - 1]), py(vals[i - 1]));
+    ctx.lineTo(px(ts[i]), py(vals[i]));
+    ctx.stroke();
+  }
+
+  // Large change markers — vertical dashed line + delta label
+  ctx.font = "bold 8px monospace";
+  ctx.textAlign = "center";
+  for (let i = 1; i < ts.length; i++) {
+    const delta = vals[i] - vals[i - 1];
+    if (Math.abs(delta) >= LARGE_DELTA) {
+      const x = px(ts[i]);
+      // Dashed vertical tick
+      ctx.strokeStyle = delta > 0 ? GREEN : RED;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2, 2]);
+      ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, H - pad.b); ctx.stroke();
+      ctx.setLineDash([]);
+      // Diamond marker at the point
+      const y = py(vals[i]);
+      ctx.fillStyle = delta > 0 ? GREEN : RED;
+      ctx.beginPath();
+      ctx.moveTo(x, y - 4); ctx.lineTo(x + 3, y); ctx.lineTo(x, y + 4); ctx.lineTo(x - 3, y);
+      ctx.closePath();
+      ctx.fill();
+      // Delta label above/below
+      const label = (delta > 0 ? "+" : "") + delta;
+      ctx.fillStyle = delta > 0 ? GREEN : RED;
+      ctx.fillText(label, x, delta > 0 ? pad.t + 5 : H - pad.b + 1);
+    }
+  }
+
+  // Endpoint dot
+  const endColor = vals.length >= 2 && vals[vals.length - 1] >= vals[vals.length - 2] ? GREEN : RED;
+  ctx.fillStyle = endColor;
+  ctx.beginPath();
+  ctx.arc(px(ts[ts.length - 1]), py(lastNps), 3, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Current value label
+  ctx.fillStyle = endColor;
+  ctx.font = "bold 9px monospace";
+  ctx.textAlign = "left";
+  ctx.fillText((lastNps > 0 ? "+" : "") + lastNps, px(ts[ts.length - 1]) + 5, py(lastNps) + 3);
 }
 
 const patientOpenState = new Set();   // user-expanded patients persist across renders
@@ -1540,7 +1753,41 @@ function renderPatientList(patients, current) {
       ? `RMSSD ${p.hrv.rmssd_ms} ms`
       : p.hrv ? `HR stdev ~${p.hrv.hr_stdev_bpm} bpm (proxy)` : "awaiting samples";
     const anxPill = anx !== "unknown" ? `<span class="pill ${anx}">${anx}</span>` : `<span class="pill unknown">—</span>`;
+    const npsVal = p.nps;
+    const npsCls = npsVal == null ? "unknown" : npsVal >= 50 ? "nps-green" : npsVal >= 0 ? "nps-yellow" : "nps-red";
+    const npsTxt = npsVal == null ? "—" : (npsVal > 0 ? "+" : "") + npsVal;
+    const npsPill = `<span class="pill ${npsCls}" title="predicted NPS">NPS ${npsTxt}</span>`;
     const emo = EMOJIS[p.emotion] || "—";
+
+    // Build intervention bars
+    const ivs = p.nps_interventions || [];
+    let ivHtml = "";
+    if (npsVal != null && ivs.length > 0) {
+      const barPct = v => Math.max(0, Math.min(100, ((v + 50) / 150) * 100));
+      const curPct = barPct(npsVal);
+      const rows = ivs.map(iv => {
+        const projPct = barPct(iv.projected);
+        const projTxt = (iv.projected > 0 ? "+" : "") + iv.projected;
+        return `<div class="nps-iv-row">
+          <div class="iv-top">
+            <span class="iv-label">${escapeHtml(iv.action)}</span>
+            <span class="iv-delta">+${iv.delta} → ${projTxt}</span>
+          </div>
+          <div class="iv-bar-track">
+            <div class="iv-bar-current" style="width:${curPct}%"></div>
+            <div class="iv-bar-delta" style="left:${curPct}%;width:${Math.max(0, projPct - curPct)}%"></div>
+            <div class="iv-bar-projected-marker" style="left:${projPct}%"></div>
+          </div>
+        </div>`;
+      }).join("");
+      ivHtml = `<div class="nps-iv-panel">
+        <div class="nps-iv-header">
+          <span class="nps-iv-title">interventions</span>
+          <span class="nps-iv-current">now <b>${npsTxt}</b></span>
+        </div>
+        ${rows}
+      </div>`;
+    }
 
     det.innerHTML = `
       <summary>
@@ -1553,6 +1800,7 @@ function renderPatientList(patients, current) {
           <span class="bay">${escapeHtml(p.bay)}</span>
           <span class="hr">${hrTxt}♥</span>
           ${anxPill}
+          ${npsPill}
           <span>${emo}</span>
         </span>
         <span class="pi-wait ${waitCls}">${waitTxt}</span>
@@ -1565,6 +1813,7 @@ function renderPatientList(patients, current) {
           <span class="chip">HRV <b>${escapeHtml(hrvTxt)}</b></span>
           <span class="chip">distress <b>${(p.distress ?? 0).toFixed(2)}</b></span>
           <span class="chip">emotion <b>${escapeHtml(p.emotion || "—")}</b></span>
+          <span class="chip">NPS <b>${npsTxt}</b></span>
         </div>
         <div class="pi-grid">
           <div>age <b>${p.age}</b></div>
@@ -1573,8 +1822,20 @@ function renderPatientList(patients, current) {
           <div>medications <b>${escapeHtml(p.meds)}</b></div>
           <div style="grid-column:1/3;">last visit <b>${escapeHtml(p.last_visit)}</b></div>
         </div>
+        <div class="nps-row">
+          <div class="nps-chart-wrap">
+            <div class="nps-chart-label">NPS trend · 3 min</div>
+            <canvas class="nps-canvas" data-pid="${p.id}" width="400" height="64"></canvas>
+          </div>
+          ${ivHtml}
+        </div>
       </div>`;
     patientListEl.appendChild(det);
+    // Draw NPS sparkline if data exists
+    if (p.nps_series && p.nps_series.length > 1) {
+      const cvs = det.querySelector(".nps-canvas");
+      if (cvs) drawNpsSparkline(cvs, p.nps_series);
+    }
   }
 
   // HR/esp dot reflects whether we have any live HR

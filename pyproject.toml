@@ -1,0 +1,10 @@
+[project]
+name = "happyclinic-hackathon-demo"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "anthropic>=0.96.0",
+    "flask>=3.1.3",
+    "pyserial>=3.5",
+]
