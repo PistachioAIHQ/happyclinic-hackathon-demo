@@ -1,8 +1,11 @@
-.pio
-.vscode/
+# Arduino build artifacts
+badge/build/
+*.elf
+*.bin
+*.hex
 
-# Secrets — local-only
-src/secrets.h
+# Editor
+.vscode/
 
 # Python / Mac
 __pycache__/
@@ -12,3 +15,8 @@ __pycache__/
 # Intermediate / backup
 tools/*.bak.py
 tools/*.bak
+
+# Persisted face-recognition database (SQLite + WAL sidecars)
+tools/faces.db
+tools/faces.db-wal
+tools/faces.db-shm

@@ -9,14 +9,12 @@ Built in a day for the OOP Hackathon.
 ## What's in here
 
 ```
-esp32/
-├── src/                  # Arduino firmware (PlatformIO)
-│   └── main.cpp          # BLE HR client + OLED face + serial protocol
-├── platformio.ini        # Board: esp32dev, lib: U8g2
-├── tools/
-│   ├── dashboard.py      # Flask app — the whole reception UI
-│   └── emotion_stream.py # CLI-only emotion classifier (pre-dashboard, kept as reference)
-└── README.md
+badge/
+└── badge.ino             # Arduino Nano ESP32 badge; polls /<patient>/nps over Wi-Fi
+tools/
+├── dashboard.py          # Flask app — reception UI + badge endpoint
+└── emotion_stream.py     # CLI-only emotion classifier (kept as reference)
+README.md
 ```
 
 ## Dashboard at a glance
@@ -39,37 +37,74 @@ watch to get true HRV.
 
 ## Hardware
 
-- ESP32 DevKit (tested with CP2102 on `/dev/cu.usbserial-0001`)
+- Arduino Nano ESP32
 - SH1106 128×64 I2C OLED
-- Common-cathode RGB LED on GPIO 32/33/4
-- Garmin watch (or any BLE HR strap — standard HR profile `0x180D / 0x2A37`)
+- Wi-Fi network shared with the computer serving Flask
 
-Firmware scans for a HR-broadcasting device, subscribes, and reports HR + RR
-intervals to the host over serial. It also accepts `emotion:<label>\n` commands
-from the host and renders a matching cartoon face on the OLED.
+The badge uses Wi-Fi at runtime. It does **not** need USB serial once flashed.
+It polls `GET /<patient_id>/nps` every 3 seconds and renders a 0-3 heart score.
 
-## Host setup (macOS)
+## Host setup
+
+### Option A: simplest path on Windows
+
+Flash the badge from Windows, and run Flask on Windows too.
+
+```powershell
+# Python deps
+py -m pip install flask pyserial anthropic
+
+# Point dashboard.py at the Nano's COM port if you need serial features later.
+$env:HAPPYCLINIC_SERIAL_PORT="COM4"
+$env:ANTHROPIC_API_KEY="sk-ant-..."
+
+# Run the dashboard from the WSL-backed repo path.
+py \\wsl.localhost\Ubuntu\home\dmhardin\projects\happyclinic-hackathon-demo\tools\dashboard.py
+```
+
+Open `http://127.0.0.1:5050`.
+
+For the badge sketch, set:
+
+- `WIFI_SSID` / `WIFI_PASS` to your real network
+- `SERVER_HOST` to your **Windows machine's LAN IP**
+- `PATIENT_ID` to one of `ciaran`, `david`, or `priya`
+
+### Option B: keep Flask in WSL
+
+This works too, but the badge cannot usually reach the WSL IP directly from the
+LAN. Forward a Windows port into WSL, then point the badge at the Windows LAN IP.
+
+Run Flask in WSL:
 
 ```bash
-# Python deps
-pip3 install --user flask pyserial anthropic
-
-# Set your key (for the Claude triage coach)
+cd /home/dmhardin/projects/happyclinic-hackathon-demo
 export ANTHROPIC_API_KEY=sk-ant-...
-
-# Plug in the ESP32 (CP2102 USB-UART). Confirm port:
-ls /dev/cu.usbserial-*
-
-# Flash firmware (one-time, requires PlatformIO)
-brew install platformio
-cd esp32
-cp src/secrets.h.example src/secrets.h   # edit WIFI_SSID / WIFI_PASS if needed
-pio run -t upload
-
-# Run dashboard
 python3 tools/dashboard.py
-# open http://127.0.0.1:5050
 ```
+
+Then in an elevated PowerShell on Windows, forward port `5050` to the current
+WSL address:
+
+```powershell
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=5050 connectaddress=<WSL_IP> connectport=5050
+```
+
+If Windows Firewall prompts, allow inbound access for port `5050`.
+
+## Flashing the Nano ESP32
+
+From Windows, use Arduino IDE or `arduino-cli` and the Windows COM port.
+
+Typical commands:
+
+```powershell
+arduino-cli compile --fqbn arduino:esp32:nano_nora \\wsl.localhost\Ubuntu\home\dmhardin\projects\happyclinic-hackathon-demo\badge
+arduino-cli upload --fqbn arduino:esp32:nano_nora -p COM4 \\wsl.localhost\Ubuntu\home\dmhardin\projects\happyclinic-hackathon-demo\badge
+```
+
+WSL can compile, but USB upload is usually much easier from Windows unless you
+also set up USB pass-through into WSL.
 
 On the iPhone (for the POV camera): **Settings → General → AirPlay & Handoff → Continuity Camera** ON. Put the phone landscape near the Mac, and select it from the POV dropdown in the dashboard.
 
@@ -78,19 +113,31 @@ On the iPhone (for the POV camera): **Settings → General → AirPlay & Handoff
 1. **Hook** — "Urgent care reception is chaos. The receptionist is the single point of failure."
 2. **Split the screen** — point to the two column headers. Left = staff wellbeing. Right = patient triage.
 3. **Walk the right column 1→4** — stats → 3D → POV → patient records.
-4. **Click "run triage now"** — Claude reads every patient's vitals, the receptionist's state, and returns prioritized actions. `[HIGH] Mark Chen: escort immediately — chest pain + SOB.` If the receptionist is stressed, it also generates a staff-facing action.
+4. **Click "run triage now"** — Claude reads every patient's vitals, the receptionist's state, and returns prioritized actions. `[HIGH] David Hardin: escort immediately — chest pain + SOB.` If the receptionist is stressed, it also generates a staff-facing action.
 5. **Close** — "We don't just watch patients. We guide staff. That's the proactive layer urgent care is missing."
 
 ## Architecture
 
-- **ESP32 firmware (`src/main.cpp`)** — BLE scan + connect to Garmin, parse HR Measurement (flags byte + HR + RR intervals), render OLED face, react to `emotion:` serial commands.
-- **Host backend (`tools/dashboard.py`)** — Flask app. Owns in-memory patient roster, runs simulator threads for non-real patients, reads ESP32 serial, forwards descriptors for face matching, calls Claude for triage.
-- **Frontend** — served inline from the Flask app. Uses face-api.js (face detection + expressions + 128-D descriptors) and Three.js (3D waiting room).
+- **Badge firmware (`badge/badge.ino`)** — joins Wi-Fi, polls `/<patient>/nps`, and renders the heart bar on the OLED.
+- **Host backend (`tools/dashboard.py`)** — Flask app. Owns the in-memory patient roster, simulator threads, badge endpoint, and triage flow.
+- **Frontend** — served inline from the Flask app. Uses face-api.js and Three.js.
 
-### Serial protocol
+### Badge endpoint
 
-Host → ESP32: `emotion:<happy|sad|angry|surprised|neutral>\n`
-ESP32 → host: `hr:<bpm>\n`, `rr:<ms>[,<ms>…]\n`
+Badge → host: `GET /<patient_id>/nps`
+
+Example response:
+
+```json
+{
+  "id": "david",
+  "name": "David Hardin",
+  "score": 1,
+  "distress": 0.84,
+  "anxiety": "elevated",
+  "intervention": false
+}
+```
 
 ### Flask endpoints
 
@@ -110,6 +157,15 @@ Edit `PATIENTS` in `tools/dashboard.py` to add/change records. Real vitals
 source is the ESP32 (routes to the first patient with `vitals_source: "real"`).
 Simulated patients are driven by `simulate_patient()` threads — pick profile
 `sim_anxious` or `sim_normal`.
+
+## Notes
+
+- `tools/dashboard.py` now reads these optional env vars:
+  `HAPPYCLINIC_SERIAL_PORT`, `HAPPYCLINIC_SERIAL_BAUD`,
+  `HAPPYCLINIC_LISTEN_HOST`, `HAPPYCLINIC_LISTEN_PORT`,
+  and `HAPPYCLINIC_MODEL`.
+- The default serial path is still the old macOS value, so on Windows set
+  `HAPPYCLINIC_SERIAL_PORT=COM4` if you want the serial features enabled.
 
 ## Known limits
 
